@@ -132,7 +132,7 @@ int32_t si_apple_signin(const char *apple_id,
 
 // Sign the IPA at ipa_path. BLOCKS. On success *out_signed_path is the signed
 // .app bundle path (in a temp dir). Registers App ID + provisioning profile and
-// retrieves/creates the dev certificate internally. `udid` (with the friendly
+// reuses an existing development certificate and its local private key. `udid` (with the friendly
 // `device_name`) is registered with the developer team BEFORE the provisioning
 // profile is requested — without it a fresh/free team fails with developer
 // error 8220 ("Your team has no devices …"). A registration failure is reported
@@ -221,6 +221,15 @@ int32_t si_cert_list(CertSession *session,
 int32_t si_cert_revoke(CertSession *session,
                        const char *serial_number,
                        char **out_error);
+
+// Synchronous Keychain bridge: read returns 0 found / 1 missing / -1 error.
+// write with length 0 deletes only the local key. Buffers are borrowed.
+typedef int32_t (*SISigningKeyRead)(const char *, uint8_t *, size_t, size_t *);
+typedef int32_t (*SISigningKeyWrite)(const char *, const uint8_t *, size_t);
+void si_signing_storage_init(SISigningKeyRead read, SISigningKeyWrite write);
+int32_t si_cert_import_key(CertSession *session, const uint8_t *cert, size_t cert_len,
+                           const uint8_t *key_pkcs1, size_t key_len, char **out_error);
+int32_t si_cert_remove_local_key(CertSession *session, const char *serial, char **out_error);
 
 // Free a certificate session.
 void si_cert_session_free(CertSession *session);

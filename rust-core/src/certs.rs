@@ -5,7 +5,9 @@
 
 use std::ffi::{c_char, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use isideload::sideload::cert_identity::CertificateIdentity;
+use isideload::util::fs_storage::FsStorage;
 
 use isideload::dev::{
     certificates::{CertificatesApi, DevelopmentCertificate},
@@ -27,6 +29,8 @@ pub struct CertSession {
     pub(crate) rt: tokio::runtime::Runtime,
     pub(crate) dev: DeveloperSession,
     pub(crate) team: DeveloperTeam,
+    apple_email: String,
+    storage_dir: PathBuf,
 }
 
 // Used only through its own runtime, serialized by Swift on one queue.
@@ -44,12 +48,14 @@ struct CertInfo {
     status: String,
     /// RFC3339 expiry (e.g. `2027-01-01T00:00:00Z`), or "" if Apple omitted it.
     expiration: String,
+    has_private_key: bool,
 }
 
 impl From<&DevelopmentCertificate> for CertInfo {
     fn from(c: &DevelopmentCertificate) -> Self {
         let s = |o: &Option<String>| o.clone().unwrap_or_default();
         CertInfo {
+            has_private_key: false,
             name: s(&c.name),
             serial_number: s(&c.serial_number),
             machine_name: s(&c.machine_name),
@@ -130,7 +136,7 @@ pub unsafe fn cert_signin(
 
     match result {
         Ok(Ok((rt, dev, team, summary))) => {
-            let session = Box::new(CertSession { rt, dev, team });
+            let session = Box::new(CertSession { rt, dev, team, apple_email: apple_id, storage_dir: PathBuf::from(storage_dir) });
             *out_session = Box::into_raw(session);
             *out_summary = cstr(summary);
             0
@@ -169,7 +175,16 @@ pub unsafe fn cert_list(
                 .await
                 .map_err(|e| format!("list certs failed: {}", report_text(&e)))?;
             tracing::info!("Certs: {} iOS development certificate(s)", certs.len());
-            let infos: Vec<CertInfo> = certs.iter().map(CertInfo::from).collect();
+            let storage = FsStorage::new(session.storage_dir.clone());
+            let mut infos = Vec::new();
+            for cert in &certs {
+                let mut info = CertInfo::from(cert);
+                if let Some(content) = &cert.cert_content {
+                    info.has_private_key = CertificateIdentity::has_local_key(&session.apple_email, content.as_ref(), &storage)
+                        .map_err(|_| "Could not read the local signing Keychain".to_string())?;
+                }
+                infos.push(info);
+            }
             serde_json::to_string(&infos).map_err(|e| format!("serialize certs: {e}"))
         })
     }));
@@ -246,5 +261,52 @@ pub unsafe fn cert_revoke(
 pub unsafe fn cert_session_free(session: *mut CertSession) {
     if !session.is_null() {
         drop(Box::from_raw(session));
+    }
+}
+
+/// Import a validated PKCS#12 key into the existing account storage. This
+/// endpoint only reads Apple certificates and cannot request or revoke one.
+pub unsafe fn cert_import_key(
+    session: *mut CertSession,
+    cert: *const u8, cert_len: usize,
+    key: *const u8, key_len: usize,
+    out_error: *mut *mut c_char,
+) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if session.is_null() || cert.is_null() || key.is_null() || cert_len == 0 || key_len == 0 || cert_len > 65536 || key_len > 16384 {
+            return Err("Invalid imported signing identity".to_string());
+        }
+        let session = &mut *session;
+        let storage = FsStorage::new(session.storage_dir.clone());
+        session.rt.block_on(CertificateIdentity::import_existing_key(
+            &session.apple_email, std::slice::from_raw_parts(cert, cert_len),
+            std::slice::from_raw_parts(key, key_len), &mut session.dev, &session.team, &storage,
+        )).map_err(|e| report_text(&e))
+    }));
+    match result {
+        Ok(Ok(())) => 0,
+        Ok(Err(error)) => { *out_error = cstr(error); 1 }
+        Err(_) => { *out_error = cstr("Could not import signing identity"); 2 }
+    }
+}
+
+pub unsafe fn cert_remove_local_key(session: *mut CertSession, serial: *const c_char, out_error: *mut *mut c_char) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if session.is_null() { return Err("No certificate session".to_string()); }
+        let serial = opt_str(serial, "");
+        let session = &mut *session;
+        session.rt.block_on(async {
+            let certs = session.dev.list_ios_certs(&session.team).await.map_err(|e| report_text(&e))?;
+            let cert = certs.iter().find(|c| c.serial_number.as_deref() == Some(&serial))
+                .ok_or_else(|| "Certificate is no longer listed on Apple".to_string())?;
+            let content = cert.cert_content.as_ref().ok_or_else(|| "Certificate content unavailable".to_string())?;
+            CertificateIdentity::remove_local_key(&session.apple_email, content.as_ref(), &FsStorage::new(session.storage_dir.clone()))
+                .map_err(|_| "Could not remove the local signing key".to_string())
+        })
+    }));
+    match result {
+        Ok(Ok(())) => 0,
+        Ok(Err(error)) => { *out_error = cstr(error); 1 }
+        Err(_) => { *out_error = cstr("Could not remove local signing key"); 2 }
     }
 }

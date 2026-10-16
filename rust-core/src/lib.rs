@@ -322,3 +322,20 @@ pub unsafe extern "C" fn si_appid_enable(
 ) -> i32 {
     entitlements::appid_enable(session, app_id_id, capabilities, out_json, out_error)
 }
+
+/// Install synchronous app-Keychain callbacks before signing or certificate operations.
+#[no_mangle]
+pub extern "C" fn si_signing_storage_init(
+    read: isideload::util::fs_storage::KeyRead,
+    write: isideload::util::fs_storage::KeyWrite,
+) { isideload::util::fs_storage::set_signing_key_storage(read, write); }
+
+#[no_mangle]
+pub unsafe extern "C" fn si_cert_import_key(session: *mut CertSession, cert: *const u8, cert_len: usize, key: *const u8, key_len: usize, error: *mut *mut c_char) -> i32 {
+    certs::cert_import_key(session, cert, cert_len, key, key_len, error)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn si_cert_remove_local_key(session: *mut CertSession, serial: *const c_char, error: *mut *mut c_char) -> i32 {
+    certs::cert_remove_local_key(session, serial, error)
+}
