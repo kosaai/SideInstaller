@@ -1,0 +1,87 @@
+name: Build SideInstaller P12 Import
+on:
+  push:
+    branches: [feature/import-existing-p12]
+    paths:
+      - ios-app/**
+      - rust-core/**
+      - tests/**
+      - project.yml
+      - .github/workflows/build-p12-import.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: p12-import-build
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      IPHONEOS_DEPLOYMENT_TARGET: "17.4"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Select latest installed Xcode
+        run: |
+          XCODE=$(find /Applications -maxdepth 1 -name 'Xcode*.app' | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustup target add aarch64-apple-ios
+          brew install xcodegen
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: p12-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: p12-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}-
+      - name: Swift syntax lint
+        run: swiftc -frontend -parse ios-app/P12Importer.swift ios-app/SigningKeychain.swift ios-app/P12ImportPresenter.swift ios-app/CertManager.swift ios-app/CertsView.swift
+      - name: PKCS12 import logic tests
+        run: bash tests/test-p12-import.sh
+      - name: Rust signing lint and typecheck
+        working-directory: rust-core
+        run: cargo clippy --locked --release --target aarch64-apple-ios --lib
+      - name: Build Rust signing engine
+        working-directory: rust-core
+        run: cargo build --locked --release --target aarch64-apple-ios
+      - name: Package FFI and generate Xcode project
+        run: |
+          xcodebuild -create-xcframework -library rust-core/target/aarch64-apple-ios/release/libsideinstaller_ffi.a -headers rust-core/include -output SideInstallerFFI.xcframework
+          xcodegen generate
+      - name: Build and typecheck iOS application
+        run: |
+          set -o pipefail
+          xcodebuild -project SideInstaller.xcodeproj -scheme SideInstaller -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build-p12 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO MARKETING_VERSION=1.5.2 CURRENT_PROJECT_VERSION=15201 build | tee "$RUNNER_TEMP/xcode-p12.log"
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p package/Payload
+          cp -R build-p12/Build/Products/Release-iphoneos/SideInstaller.app package/Payload/
+          cd package
+          zip -qry ../SideInstaller-P12Import.ipa Payload
+          cd ..
+          shasum -a 256 SideInstaller-P12Import.ipa > SideInstaller-P12Import.sha256
+          unzip -tq SideInstaller-P12Import.ipa
+          echo "Unsigned IPA built from commit $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SideInstaller-P12Import
+          path: |
+            SideInstaller-P12Import.ipa
+            SideInstaller-P12Import.sha256
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: p12-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}-${{ github.sha }}
