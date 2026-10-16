@@ -3,34 +3,35 @@ use apple_codesign_quick::{
 };
 use plist::Dictionary;
 use rootcause::prelude::*;
+use std::collections::HashMap;
 use tracing::info;
 
 use crate::{
-    dev::{app_ids::Profile, teams::DeveloperTeam},
+    dev::teams::DeveloperTeam,
     sideload::{
         application::{Application, SpecialApp},
         cert_identity::CertificateIdentity,
     },
 };
 
-/// Signs the app and every bundle in it with apple-codesign-quick, which
-/// hashes and signs nested bundles in parallel (upstream cc9fa9c, iLoader
-/// 2.3.0), and embeds the provisioning profile while doing so.
-///
-/// Every app extension, nested ones too, gets the main app's entitlements and
-/// a copy of its profile, as before the switch: the main profile is the one
-/// that authorizes them (README change 1). apple-codesign-quick gives a nested
-/// bundle only what is listed for its bundle ID, which by default is no profile
-/// and no entitlements, so each extension is listed. Frameworks and dylibs get
-/// neither, as Xcode signs them.
+pub struct TargetProfile {
+    pub encoded: Vec<u8>,
+    pub entitlements: Dictionary,
+}
+
+/// Every installable target gets its own validated profile and entitlements.
+/// Frameworks/dylibs get neither. The signer signs children before parents.
 pub fn sign(
     app: &mut Application,
     cert_identity: &CertificateIdentity,
-    provisioning_profile: &Profile,
-    special: &Option<SpecialApp>,
+    profiles: &HashMap<String, TargetProfile>,
     team: &DeveloperTeam,
 ) -> Result<(), Report> {
-    let profile_der: &[u8] = provisioning_profile.encoded_profile.as_ref();
+    let main_id = app.main_bundle_id()?;
+    let main = profiles
+        .get(&main_id)
+        .ok_or_else(|| report!("Missing profile for {main_id}"))?;
+    let profile_der = main.encoded.as_slice();
     let profile =
         ProvisioningProfile::parse(profile_der).context("Failed to parse provisioning profile")?;
     let certificate_chain = cert_identity
@@ -42,25 +43,24 @@ pub fn sign(
         certificate_chain,
     );
 
-    let entitlements = entitlements(&profile, special, team);
-
     clear_old_signatures(app)?;
 
-    let mut settings = BundleSigningSettings::new(&team.team_id, entitlements.clone(), Some(&signer));
+    let mut settings =
+        BundleSigningSettings::new(&team.team_id, main.entitlements.clone(), Some(&signer));
     settings.embedded_mobileprovision = Some(profile_der);
-    for bundle in app.bundle.collect_nested_bundles() {
-        if bundle.bundle_dir.extension().and_then(|e| e.to_str()) != Some("appex") {
-            continue;
-        }
-        let Some(bundle_id) = bundle.bundle_identifier() else {
-            continue;
-        };
+    for bundle in app.bundle.signing_targets().into_iter().skip(1) {
+        let bundle_id = bundle
+            .bundle_identifier()
+            .ok_or_else(|| report!("Target has no Bundle ID."))?;
+        let target = profiles
+            .get(bundle_id)
+            .ok_or_else(|| report!("Missing profile for {bundle_id}"))?;
         settings
             .embedded_mobileprovisions_by_bundle_id
-            .insert(bundle_id.to_string(), profile_der);
+            .insert(bundle_id.to_string(), target.encoded.as_slice());
         settings
             .entitlements_by_bundle_id
-            .insert(bundle_id.to_string(), entitlements.clone());
+            .insert(bundle_id.to_string(), target.entitlements.clone());
     }
 
     info!(
@@ -89,7 +89,8 @@ pub fn sign(
 /// skipped the folder.
 fn clear_old_signatures(app: &Application) -> Result<(), Report> {
     let nested = app.bundle.collect_nested_bundles();
-    let bundle_dirs = std::iter::once(&app.bundle.bundle_dir).chain(nested.iter().map(|b| &b.bundle_dir));
+    let bundle_dirs =
+        std::iter::once(&app.bundle.bundle_dir).chain(nested.iter().map(|b| &b.bundle_dir));
     for bundle_dir in bundle_dirs {
         let signature_dir = bundle_dir.join("_CodeSignature");
         if signature_dir.is_dir() {
@@ -103,7 +104,7 @@ fn clear_old_signatures(app: &Application) -> Result<(), Report> {
 }
 
 /// The profile's entitlements, plus the keychain groups LiveContainer needs.
-fn entitlements(
+pub(super) fn entitlements(
     profile: &ProvisioningProfile,
     special: &Option<SpecialApp>,
     team: &DeveloperTeam,

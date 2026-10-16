@@ -16,12 +16,17 @@ use crate::{
     util::{device::IdeviceInfo, storage::SideloadingStorage},
 };
 
-use std::path::PathBuf;
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
-use futures_util::future::{try_join, try_join3, try_join_all};
+use super::{imported_profiles, requested_entitlements};
+use futures_util::future::try_join_all;
 use idevice::provider::IdeviceProvider;
 use rootcause::{option_ext::OptionExt, prelude::*};
 use tracing::info;
+use x509_cert::der::Encode;
 
 pub struct Sideloader {
     team_selection: TeamSelection,
@@ -87,104 +92,174 @@ impl Sideloader {
             None => self.get_team().await?,
         };
 
-        // Requests that don't depend on each other go out together, each on its
-        // own copy of the developer session. Anisette headers are fetched once
-        // first, so every copy reuses them instead of asking the server again.
+        let mut app = tokio::task::spawn_blocking(move || Application::new(app_path))
+            .await
+            .map_err(|e| report!("Failed to open application archive: {e}"))??;
+        let special = app.get_special_app();
+        let originals: HashMap<_, _> = app
+            .bundle
+            .signing_targets()
+            .into_iter()
+            .map(|b| {
+                let id = b.bundle_identifier().unwrap_or("").to_owned();
+                (b.bundle_dir, id)
+            })
+            .collect();
+        let imported = imported_profiles::load(self.storage.as_ref())?;
+        let old_main = app.main_bundle_id()?;
+        // Imported profiles preserve exact IPA IDs when available. Otherwise
+        // retain SideInstaller's team-suffixed IDs (including Side by Side).
+        let main_id = if originals
+            .values()
+            .any(|id| imported.iter().any(|p| p.matches_bundle(id)))
+        {
+            old_main.clone()
+        } else {
+            imported_profiles::main_bundle_id(&imported, &old_main, &team.team_id)
+        };
+        if main_id != old_main {
+            app.update_bundle_id(&old_main, &main_id)?;
+        }
+        let targets = app.bundle.signing_targets();
+        let mut unique = HashSet::new();
+        for target in &targets {
+            let id = target
+                .bundle_identifier()
+                .ok_or_else(|| report!("Target has no Bundle ID."))?;
+            if !unique.insert(id.to_owned()) {
+                bail!("Duplicate signing target Bundle ID: {id}");
+            }
+        }
         self.dev_session
             .get_headers()
             .await
             .context("Failed to get anisette headers")?;
-        let mut device_session = self.dev_session.clone();
-        let mut cert_session = self.dev_session.clone();
-        let mut app_id_session = self.dev_session.clone();
-        let mut group_session = self.dev_session.clone();
-
-        let registration = async {
-            if let Some((name, udid)) = register_device
-                && let Err(e) = device_session
+        let cert_identity = CertificateIdentity::retrieve(
+            &self.machine_name,
+            &self.apple_email,
+            &mut self.dev_session,
+            &team,
+            self.storage.as_ref(),
+            &self.max_certs_behavior,
+        )
+        .await?;
+        let cert_der = cert_identity.certificate.to_der()?;
+        let udid = register_device.map(|(_, udid)| udid);
+        let mut profiles = HashMap::new();
+        let mut imported_ids = HashSet::new();
+        let target_ids: Vec<_> = targets
+            .iter()
+            .map(|t| t.bundle_identifier().unwrap_or("").to_owned())
+            .collect();
+        let (selected, fallback) =
+            imported_profiles::plan(&imported, &target_ids, &team.team_id, udid, &cert_der)?;
+        // Entire imported plan is checked before ANY portal mutation. Invalid
+        // matches must not turn into profile generation or App ID creation.
+        for target in &targets {
+            let id = target.bundle_identifier().unwrap_or("");
+            if let Some(profile) = selected.get(id) {
+                let executable = target
+                    .app_info
+                    .get("CFBundleExecutable")
+                    .and_then(plist::Value::as_string)
+                    .filter(|s| {
+                        !s.is_empty()
+                            && !s.contains('/')
+                            && !s.contains('\\')
+                            && *s != "."
+                            && *s != ".."
+                    })
+                    .ok_or_else(|| report!("Missing or invalid executable for {id}."))?;
+                let mut requested =
+                    requested_entitlements::read(&target.bundle_dir.join(executable))?;
+                if matches!(
+                    special,
+                    Some(SpecialApp::SideStoreLc | SpecialApp::LiveContainer)
+                ) {
+                    let parsed =
+                        apple_codesign_quick::ProvisioningProfile::parse(&profile.encoded)?;
+                    if let Some(groups) =
+                        sign::entitlements(&parsed, &special, &team).get("keychain-access-groups")
+                    {
+                        requested.insert("keychain-access-groups".into(), groups.clone());
+                    }
+                }
+                let mut entitlements = requested_entitlements::for_profile(
+                    profile,
+                    &requested,
+                    id,
+                    originals
+                        .get(&target.bundle_dir)
+                        .map(String::as_str)
+                        .unwrap_or(id),
+                )?;
+                if increased_memory_limit {
+                    let mut memory = plist::Dictionary::new();
+                    memory.insert(
+                        "com.apple.developer.kernel.increased-memory-limit".into(),
+                        true.into(),
+                    );
+                    let checked = requested_entitlements::for_profile(profile, &memory, id, id)?;
+                    entitlements.insert(
+                        "com.apple.developer.kernel.increased-memory-limit".into(),
+                        checked["com.apple.developer.kernel.increased-memory-limit"].clone(),
+                    );
+                }
+                profiles.insert(
+                    id.to_owned(),
+                    sign::TargetProfile {
+                        encoded: profile.encoded.clone(),
+                        entitlements,
+                    },
+                );
+                imported_ids.insert(id.to_owned());
+            }
+        }
+        let group_identifier = profiles
+            .get(&main_id)
+            .and_then(|p| p.entitlements.get("com.apple.security.application-groups"))
+            .and_then(plist::Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(plist::Value::as_string)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                format!(
+                    "group.{}",
+                    if Some(SpecialApp::SideStoreLc) == special {
+                        format!("com.SideStore.SideStore.{}", team.team_id)
+                    } else {
+                        main_id.clone()
+                    }
+                )
+            });
+        // Portal fallback is per missing target, never for a validated imported
+        // one. The existing reuse-only certificate path remains unchanged.
+        if !fallback.is_empty() {
+            if let Some((name, udid)) = register_device {
+                self.dev_session
                     .ensure_device_registered(&team, name, udid, None)
                     .await
-            {
-                bail!("device registration failed for UDID {udid}: {e}");
+                    .context("device registration failed")?;
             }
-            Ok::<(), Report>(())
-        };
-
-        let certificate = async {
-            Ok::<_, Report>(
-                CertificateIdentity::retrieve(
-                    &self.machine_name,
-                    &self.apple_email,
-                    &mut cert_session,
-                    &team,
-                    self.storage.as_ref(),
-                    &self.max_certs_behavior,
+            let mut app_ids = app
+                .register_app_ids(&mut self.dev_session, &team, &imported_ids)
+                .await?;
+            let group = if app_group {
+                Some(
+                    self.dev_session
+                        .ensure_app_group(&team, &app.main_app_name()?, &group_identifier, None)
+                        .await?,
                 )
-                .await
-                .context("Failed to retrieve certificate identity")?,
-            )
-        };
-
-        // Extracting the archive is blocking work, so it runs off this task and
-        // the requests above keep moving meanwhile.
-        let bundle = async {
-            let mut app = tokio::task::spawn_blocking(move || Application::new(app_path))
-                .await
-                .map_err(|e| report!("Failed to open application archive: {e}"))??;
-            let special = app.get_special_app();
-
-            let main_bundle_id = app.main_bundle_id()?;
-            let main_app_name = app.main_app_name()?;
-            let main_app_id_str = format!("{}.{}", main_bundle_id, team.team_id);
-            app.update_bundle_id(&main_bundle_id, &main_app_id_str)?;
-
-            let group_identifier = format!(
-                "group.{}",
-                if Some(SpecialApp::SideStoreLc) == special {
-                    format!("com.SideStore.SideStore.{}", team.team_id)
-                } else {
-                    main_app_id_str.clone()
-                }
-            );
-
-            let (mut app_ids, app_group) = try_join(
-                app.register_app_ids(
-                    /*&self.extensions_behavior, */ &mut app_id_session,
-                    &team,
-                ),
-                async {
-                    if !app_group {
-                        return Ok(None);
-                    }
-                    group_session
-                        .ensure_app_group(&team, &main_app_name, &group_identifier, None)
-                        .await
-                        .map(Some)
-                },
-            )
-            .await?;
-
-            let main_app_id = app_ids
-                .iter()
-                .find(|app_id| app_id.identifier == main_app_id_str)
-                .cloned()
-                .ok_or_else(|| {
-                    report!(
-                        "Main app ID {} not found in registered app IDs",
-                        main_app_id_str
-                    )
-                })?;
-
-            // Each App ID is configured on its own session, all at once.
+            } else {
+                None
+            };
             try_join_all(app_ids.iter_mut().map(|app_id| {
-                let mut session = app_id_session.clone();
-                let (team, app_group) = (&team, &app_group);
+                let mut session = self.dev_session.clone();
+                let (team, group) = (&team, &group);
                 async move {
-                    if let Some(app_group) = app_group {
+                    if let Some(group) = group {
                         app_id.ensure_group_feature(&mut session, team).await?;
-                        session
-                            .assign_app_group(team, app_group, app_id, None)
-                            .await?;
+                        session.assign_app_group(team, group, app_id, None).await?;
                     }
                     if increased_memory_limit {
                         session.add_increased_memory_limit(team, app_id).await?;
@@ -193,60 +268,35 @@ impl Sideloader {
                 }
             }))
             .await?;
-
-            info!("App IDs configured");
-            Ok::<_, Report>((app, special, group_identifier, main_app_id))
-        };
-
-        let ((), cert_identity, (mut app, special, group_identifier, main_app_id)) =
-            try_join3(registration, certificate, bundle).await?;
-
-        // The profile has to come after the device and App IDs are set up; the
-        // certificate goes into the bundle meanwhile.
-        let dev_session = &mut self.dev_session;
-        let ((), provisioning_profile) = try_join(
-            async {
-                app.apply_special_app_behavior(
-                    &special,
-                    &group_identifier,
-                    &cert_identity,
-                    register_device.map(|(_, udid)| udid),
-                    pairing_file,
-                )
-                .await
-                .context("Failed to modify app bundle")?;
-                Ok::<(), Report>(())
-            },
-            async {
-                let profile = dev_session
-                    .download_team_provisioning_profile(&team, &main_app_id, None)
+            for app_id in &app_ids {
+                let downloaded = self
+                    .dev_session
+                    .download_team_provisioning_profile(&team, app_id, None)
                     .await?;
-                info!("Acquired provisioning profile");
-                Ok::<_, Report>(profile)
-            },
-        )
-        .await?;
-
-        app.bundle.write_info()?;
-        for ext in app.bundle.app_extensions_mut() {
-            ext.write_info()?;
+                let data: &[u8] = downloaded.encoded_profile.as_ref();
+                let parsed = imported_profiles::ImportedProfile::parse(data)?;
+                parsed.validate(&app_id.identifier, &team.team_id, udid, &cert_der)?;
+                let profile = apple_codesign_quick::ProvisioningProfile::parse(data)?;
+                profiles.insert(
+                    app_id.identifier.clone(),
+                    sign::TargetProfile {
+                        encoded: data.to_vec(),
+                        entitlements: sign::entitlements(&profile, &special, &team),
+                    },
+                );
+            }
         }
-        for ext in app.bundle.frameworks_mut() {
-            ext.write_info()?;
-        }
-
-        // `sign` writes embedded.mobileprovision into the app and each .appex
-        // as it signs them, since the profile is sealed into CodeResources.
-        // Hosts read an extension's copy back: AltStore-family apps reject an
-        // extension without one.
-        sign::sign(
-            &mut app,
-            &cert_identity,
-            &provisioning_profile,
+        app.apply_special_app_behavior(
             &special,
-            &team,
+            &group_identifier,
+            &cert_identity,
+            udid,
+            pairing_file,
         )
-        .context("Failed to sign app")?;
+        .await
+        .context("Failed to modify app bundle")?;
+        app.bundle.write_all_info()?;
+        sign::sign(&mut app, &cert_identity, &profiles, &team).context("Failed to sign app")?;
 
         info!("App signed!");
 

@@ -145,24 +145,30 @@ impl Application {
         main_app_bundle_id: &str,
         main_app_id_str: &str,
     ) -> Result<(), Report> {
-        let extensions = self.bundle.app_extensions_mut();
-        for ext in extensions.iter_mut() {
-            if let Some(id) = ext.bundle_identifier() {
-                if !(id.starts_with(main_app_bundle_id) && id.len() > main_app_bundle_id.len()) {
-                    bail!(SideloadError::InvalidBundle(format!(
-                        "Extension {} is not part of the main app bundle identifier: {}",
-                        ext.bundle_name().unwrap_or("Unknown"),
-                        id
-                    )));
-                } else {
-                    ext.set_bundle_identifier(&format!(
-                        "{}{}",
-                        main_app_id_str,
-                        &id[main_app_bundle_id.len()..]
-                    ));
+        fn update_extensions(bundle: &mut Bundle, old: &str, new: &str) -> Result<(), Report> {
+            for ext in bundle.app_extensions_mut().iter_mut() {
+                if let Some(id) = ext.bundle_identifier() {
+                    if !id
+                        .strip_prefix(old)
+                        .is_some_and(|suffix| suffix.starts_with('.'))
+                    {
+                        bail!(SideloadError::InvalidBundle(format!(
+                            "Extension {} is not part of the main app bundle identifier: {}",
+                            ext.bundle_name().unwrap_or("Unknown"),
+                            id
+                        )));
+                    } else {
+                        ext.set_bundle_identifier(&format!("{}{}", new, &id[old.len()..]));
+                    }
                 }
+                update_extensions(ext, old, new)?;
             }
+            for framework in bundle.frameworks_mut() {
+                update_extensions(framework, old, new)?;
+            }
+            Ok(())
         }
+        update_extensions(&mut self.bundle, main_app_bundle_id, main_app_id_str)?;
         self.bundle.set_bundle_identifier(main_app_id_str);
 
         Ok(())
@@ -173,10 +179,17 @@ impl Application {
         //mode: &ExtensionsBehavior,
         dev_session: &mut DeveloperSession,
         team: &DeveloperTeam,
+        imported_ids: &std::collections::HashSet<String>,
     ) -> Result<Vec<AppId>, Report> {
-        let extension_refs: Vec<_> = self.bundle.app_extensions().iter().collect();
-        let mut bundles_with_app_id = vec![&self.bundle];
-        bundles_with_app_id.extend(extension_refs);
+        let bundles_with_app_id: Vec<_> = self
+            .bundle
+            .signing_targets()
+            .into_iter()
+            .filter(|b| !imported_ids.contains(b.bundle_identifier().unwrap_or("")))
+            .collect();
+        if bundles_with_app_id.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let list_app_ids_response = dev_session
             .list_app_ids(team, None)
@@ -298,7 +311,8 @@ impl Application {
         }
 
         if matches!(special, SpecialApp::AltStore) {
-            self.bundle_pairing_file(pairing_file, &cert.machine_id).await?;
+            self.bundle_pairing_file(pairing_file, &cert.machine_id)
+                .await?;
         }
         Ok(())
     }
@@ -347,13 +361,16 @@ impl Application {
         ) {
             let app_groups =
                 plist::Value::Array(vec![plist::Value::String(group_identifier.to_string())]);
-            self.bundle.app_info.insert("ALTAppGroups".to_string(), app_groups.clone());
+            self.bundle
+                .app_info
+                .insert("ALTAppGroups".to_string(), app_groups.clone());
             // Each extension reads the group from its own Info.plist. The widget
             // in AltStore and in SideStore releases up to 0.7.0-alpha opens the
             // shared database through it; without it, it opens an empty one in
             // its own container. Upstream c23db68 (iLoader 2.3.6).
             for ext in self.bundle.app_extensions_mut() {
-                ext.app_info.insert("ALTAppGroups".to_string(), app_groups.clone());
+                ext.app_info
+                    .insert("ALTAppGroups".to_string(), app_groups.clone());
             }
         }
 
@@ -369,9 +386,7 @@ impl Application {
                     plist::Value::String(device_udid.to_string()),
                 );
             } else {
-                warn!(
-                    "No device UDID to give AltStore; it keeps the ALTDeviceID it shipped with"
-                );
+                warn!("No device UDID to give AltStore; it keeps the ALTDeviceID it shipped with");
             }
         }
     }
@@ -448,7 +463,10 @@ mod tests {
                 plist::to_file_xml(dir.join("Info.plist"), &dict).unwrap();
             };
             write_info(&app_dir, info);
-            write_info(&widget_dir, &[("CFBundleIdentifier", "com.example.app.widget")]);
+            write_info(
+                &widget_dir,
+                &[("CFBundleIdentifier", "com.example.app.widget")],
+            );
 
             let app = Application {
                 bundle: Bundle::new(app_dir).unwrap(),
@@ -477,12 +495,24 @@ mod tests {
 
     #[test]
     fn app_groups_reach_the_extensions() {
-        for special in [SpecialApp::SideStore, SpecialApp::SideStoreLc, SpecialApp::AltStore] {
+        for special in [
+            SpecialApp::SideStore,
+            SpecialApp::SideStoreLc,
+            SpecialApp::AltStore,
+        ] {
             let mut test = TestApp::new(&[("CFBundleIdentifier", "com.example.app")]);
             test.app.set_alt_info(&special, GROUP, Some("UDID"));
 
-            assert_eq!(test.main_value("ALTAppGroups"), Some(&groups()), "{special}");
-            assert_eq!(test.widget_value("ALTAppGroups"), Some(&groups()), "{special}");
+            assert_eq!(
+                test.main_value("ALTAppGroups"),
+                Some(&groups()),
+                "{special}"
+            );
+            assert_eq!(
+                test.widget_value("ALTAppGroups"),
+                Some(&groups()),
+                "{special}"
+            );
         }
     }
 
@@ -505,7 +535,8 @@ mod tests {
         ];
 
         let mut test = TestApp::new(&shipped);
-        test.app.set_alt_info(&SpecialApp::AltStore, GROUP, Some("DEVICE-UDID"));
+        test.app
+            .set_alt_info(&SpecialApp::AltStore, GROUP, Some("DEVICE-UDID"));
         assert_eq!(test.main_value("ALTDeviceID"), Some(&"DEVICE-UDID".into()));
         assert_eq!(test.widget_value("ALTDeviceID"), None);
 
@@ -573,7 +604,8 @@ mod tests {
     #[test]
     fn only_altstore_gets_the_device_udid() {
         let mut test = TestApp::new(&[("CFBundleIdentifier", "com.SideStore.SideStore")]);
-        test.app.set_alt_info(&SpecialApp::SideStore, GROUP, Some("UDID"));
+        test.app
+            .set_alt_info(&SpecialApp::SideStore, GROUP, Some("UDID"));
 
         assert_eq!(test.main_value("ALTDeviceID"), None);
     }

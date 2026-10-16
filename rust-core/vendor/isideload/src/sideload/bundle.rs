@@ -56,8 +56,8 @@ impl Bundle {
                     entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
                         && entry.path().join("Info.plist").exists()
                 })
-                .filter_map(|entry| Bundle::new(entry.path()).ok())
-                .collect()
+                .map(|entry| Bundle::new(entry.path()))
+                .collect::<Result<Vec<_>, _>>()?
         } else {
             Vec::new()
         };
@@ -74,8 +74,8 @@ impl Bundle {
                     entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
                         && entry.path().join("Info.plist").exists()
                 })
-                .filter_map(|entry| Bundle::new(entry.path()).ok())
-                .collect()
+                .map(|entry| Bundle::new(entry.path()))
+                .collect::<Result<Vec<_>, _>>()?
         } else {
             Vec::new()
         };
@@ -192,6 +192,19 @@ impl Bundle {
         self.collect_nested_bundles_into(&mut bundles);
         bundles.extend(self.collect_dylib_bundles());
         bundles
+    }
+
+    /// Each installable target requires its own provisioning profile.
+    pub fn signing_targets(&self) -> Vec<Bundle> {
+        std::iter::once(self.clone()).chain(self.collect_nested_bundles().into_iter()
+            .filter(|b| matches!(b.bundle_dir.extension().and_then(|e| e.to_str()), Some("appex" | "app"))))
+            .collect()
+    }
+
+    pub fn write_all_info(&self) -> Result<(), Report> {
+        self.write_info()?;
+        for bundle in self.app_extensions.iter().chain(&self.frameworks) { bundle.write_all_info()?; }
+        Ok(())
     }
 
     pub fn collect_bundles_sorted(&self) -> Vec<Bundle> {

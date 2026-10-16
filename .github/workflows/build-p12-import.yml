@@ -1,4 +1,4 @@
-name: Build SideInstaller P12 Import
+name: Build SideInstaller P12 and Profiles Import
 on:
   push:
     branches: [feature/import-existing-p12]
@@ -47,7 +47,7 @@ jobs:
           key: p12-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}-${{ github.sha }}
           restore-keys: p12-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}-
       - name: Swift syntax lint
-        run: swiftc -frontend -parse ios-app/P12Importer.swift ios-app/SigningKeychain.swift ios-app/P12ImportPresenter.swift ios-app/CertManager.swift ios-app/CertsView.swift
+        run: swiftc -frontend -parse ios-app/*.swift
       - name: Swift iOS typecheck
         run: xcrun swiftc -swift-version 5 -typecheck -target arm64-apple-ios17.4 -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" -I rust-core/include ios-app/*.swift
       - name: Rust signing lint and typecheck
@@ -71,7 +71,7 @@ jobs:
       - name: Build and typecheck iOS application
         run: |
           set -o pipefail
-          xcodebuild -project SideInstaller.xcodeproj -scheme SideInstaller -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build-p12 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO MARKETING_VERSION=1.5.2 CURRENT_PROJECT_VERSION=15201 build | tee "$RUNNER_TEMP/xcode-p12.log"
+          xcodebuild -project SideInstaller.xcodeproj -scheme SideInstaller -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build-p12 CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO MARKETING_VERSION=1.5.2 CURRENT_PROJECT_VERSION=15202 build | tee "$RUNNER_TEMP/xcode-p12.log"
       - name: Package unsigned IPA
         run: |
           mkdir -p package/Payload
@@ -88,17 +88,17 @@ jobs:
               print(target.name, info["CFBundleIdentifier"], info["CFBundleShortVersionString"])
           PY
           cd package
-          zip -qry ../SideInstaller-P12Import.ipa Payload
+          zip -qry ../SideInstaller-P12Profiles.ipa Payload
           cd ..
-          shasum -a 256 SideInstaller-P12Import.ipa > SideInstaller-P12Import.sha256
-          unzip -tq SideInstaller-P12Import.ipa
+          shasum -a 256 SideInstaller-P12Profiles.ipa > SideInstaller-P12Profiles.sha256
+          unzip -tq SideInstaller-P12Profiles.ipa
           echo "Unsigned IPA built from commit $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
-          name: SideInstaller-P12Import
+          name: SideInstaller-P12Profiles
           path: |
-            SideInstaller-P12Import.ipa
-            SideInstaller-P12Import.sha256
+            SideInstaller-P12Profiles.ipa
+            SideInstaller-P12Profiles.sha256
           if-no-files-found: error
           retention-days: 14
       - uses: actions/cache/save@v4
@@ -127,9 +127,31 @@ jobs:
             rust-core/target
           key: p12-test-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}-${{ github.sha }}
           restore-keys: p12-test-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}-
-      - name: Test identity reuse, missing keys, team matching and local-only removal
+      - name: Test imported profiles, per-target selection, entitlements and P12 identity regressions
         working-directory: rust-core
-        run: cargo test --locked -p isideload --lib imported_identity_tests
+        run: |
+          cargo test --locked -p isideload --lib
+          cargo check --locked -p isideload --example validate_imported_profiles
+      - name: Validate production profile import and per-target matching with signing profiles
+        working-directory: rust-core
+        env:
+          MAIN_PROFILE: ${{ secrets.SIDEINSTALLER_MAIN_PROFILE_BASE64 }}
+          EXT_PROFILE: ${{ secrets.SIDEINSTALLER_LIVEACTIVITY_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          FIXTURES=$(mktemp -d "$RUNNER_TEMP/profile-compatibility.XXXXXX")
+          export FIXTURES
+          trap 'rm -rf "$FIXTURES"' EXIT
+          python3 - <<'PY'
+          import os, base64
+          from pathlib import Path
+          for name, filename in [("MAIN_PROFILE", "main.mobileprovision"), ("EXT_PROFILE", "extension.mobileprovision")]:
+              value = os.environ.get(name, "")
+              if not value: raise SystemExit("Missing provisioning profile secret: " + name)
+              Path(os.environ["FIXTURES"], filename).write_bytes(base64.b64decode(value, validate=True))
+          PY
+          cargo run --locked -p isideload --example validate_imported_profiles -- "$FIXTURES/main.mobileprovision" "$FIXTURES/extension.mobileprovision" 6JKQ4V5NDG 00008150-0001358C36D9401C f4a0f130fa62b9aabdf960ff04c79d863cab038f7e41aef2637cbb1690d7b208 com.frizzlem.sideinstaller.6JKQ4V5NDG com.frizzlem.sideinstaller.6JKQ4V5NDG.LiveActivity "$FIXTURES/store"
       - uses: actions/cache/save@v4
         if: always()
         with:

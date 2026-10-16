@@ -15,6 +15,7 @@ mod error_text;
 mod ffi_util;
 mod logging;
 mod pairing;
+mod profiles;
 
 use std::ffi::{c_char, c_void};
 
@@ -57,6 +58,18 @@ fn idevice_version() -> &'static str {
 #[no_mangle]
 pub unsafe extern "C" fn si_string_free(p: *mut c_char) {
     ffi_util::string_free(p);
+}
+
+/// Local-only profile import/list/removal. All input buffers are borrowed.
+/// # Safety
+/// C strings and data must be valid for the call; output pointers writable.
+#[no_mangle]
+pub unsafe extern "C" fn si_profiles(
+    storage_dir: *const c_char, apple_email: *const c_char, udid: *const c_char,
+    action: *const c_char, uuid: *const c_char, data: *const u8, data_len: usize,
+    out_json: *mut *mut c_char, out_error: *mut *mut c_char,
+) -> i32 {
+    profiles::profiles(storage_dir, apple_email, udid, action, uuid, data, data_len, out_json, out_error)
 }
 
 // ---------------------------------------------------------------------------

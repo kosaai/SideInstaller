@@ -234,6 +234,13 @@ int32_t si_cert_remove_local_key(CertSession *session, const char *serial, char 
 // Free a certificate session.
 void si_cert_session_free(CertSession *session);
 
+// Local-only profile operations: action is import/list/remove. No Apple calls.
+// JSON contains metadata/readiness only; raw profile/certificate bytes are not
+// returned or logged. Free both output strings with si_string_free.
+int32_t si_profiles(const char *storage_dir, const char *apple_email, const char *udid,
+                    const char *action, const char *uuid, const uint8_t *data, size_t data_len,
+                    char **out_json, char **out_error);
+
 // ---------------------------------------------------------------------------
 // Entitlements — enable developer-portal capabilities on an App ID
 // ---------------------------------------------------------------------------

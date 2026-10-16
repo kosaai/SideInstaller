@@ -293,13 +293,29 @@ impl CertificateIdentity {
         }
         let encoded = key.to_pkcs8_der()?;
         storage.store_data(&Self::key_path(apple_email), encoded.as_bytes())?;
+        // Public certificate metadata is local app data, never private-key
+        // storage. Profiles can be checked offline against the exact P12 DER.
+        storage.store_data(&Self::certificate_path(apple_email), certificate_der)?;
         Ok(())
+    }
+
+    fn certificate_path(apple_email: &str) -> String {
+        format!("{}/imported-certificate.der", hex::encode(Sha256::digest(apple_email.as_bytes())))
+    }
+
+    pub fn local_certificate(apple_email: &str, storage: &dyn SideloadingStorage) -> Result<Option<Vec<u8>>, Report> {
+        let certificate = storage.retrieve_data(&Self::certificate_path(apple_email))?;
+        match certificate {
+            Some(der) if Self::has_local_key(apple_email, &der, storage)? => Ok(Some(der)),
+            _ => Ok(None),
+        }
     }
 
     /// Local storage only. There is deliberately no DeveloperSession here.
     pub fn remove_local_key(apple_email: &str, certificate_der: &[u8], storage: &dyn SideloadingStorage) -> Result<(), Report> {
         if Self::has_local_key(apple_email, certificate_der, storage)? {
             storage.delete(&Self::key_path(apple_email))?;
+            storage.delete(&Self::certificate_path(apple_email))?;
         }
         Ok(())
     }

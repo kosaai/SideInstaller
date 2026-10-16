@@ -7,3 +7,6 @@ pub mod install;
 pub mod sideloader;
 pub mod sign;
 pub use builder::{SideloaderBuilder, TeamSelection};
+pub mod imported_profiles;
+mod profile_cms;
+pub mod requested_entitlements;

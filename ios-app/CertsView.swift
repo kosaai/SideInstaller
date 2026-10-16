@@ -5,6 +5,8 @@ struct CertsView: View {
     /// Observed so labels redraw when the language changes.
     @EnvironmentObject private var loc: Localizer
     @ObservedObject var manager: CertManager
+    @StateObject private var profiles = ImportedProfilesManager()
+    @ObservedObject private var engine = Engine.shared
 
     @State private var showSettings = false
     @State private var pendingRemoval: DevCert?
@@ -17,7 +19,12 @@ struct CertsView: View {
                     Label("Import P12 / PFX", systemImage: "square.and.arrow.down")
                 }
                 .buttonStyle(PrimaryButtonStyle())
-                .disabled(manager.isWorking || Engine.shared.isRunning)
+                .disabled(manager.isWorking || profiles.isWorking || engine.isRunning)
+                Button { profiles.showImporter = true } label: {
+                    Label("Import Provisioning Profile", systemImage: "doc.badge.plus")
+                }
+                .buttonStyle(PrimaryButtonStyle())
+                .disabled(manager.isWorking || profiles.isWorking || engine.isRunning)
                 loadButton.cascadeItem(1)
                 if let summary = manager.importSummary {
                     PanelCard {
@@ -30,6 +37,7 @@ struct CertsView: View {
                 }
                 // Errors show as a popup, which `RootView` lays over the app.
                 certList
+                ImportedProfilesView(manager: profiles, disabled: manager.isWorking || engine.isRunning)
             }
             .padding(20)
             .animation(.smooth(duration: 0.35), value: manager.certs)
@@ -39,7 +47,14 @@ struct CertsView: View {
         .background(AppBackground())
         .toolbar { settingsToolbarItem(isPresented: $showSettings) }
         .sheet(isPresented: $showSettings) { SettingsView() }
-        .onAppear { manager.autoLoad() }
+        .onAppear { manager.autoLoad(); profiles.refresh() }
+        .onChange(of: manager.importSummary) { _, _ in profiles.refresh() }
+        .onChange(of: manager.certs) { _, _ in profiles.refresh() }
+        .onChange(of: engine.deviceUDID) { _, _ in profiles.refresh() }
+        .onChange(of: engine.isRunning) { _, running in if !running { profiles.refresh() } }
+        .onChange(of: profiles.lastError) { _, error in
+            if let error { manager.lastError = error; profiles.lastError = nil }
+        }
         .alert("Remove Local Key?", isPresented: Binding(
             get: { pendingRemoval != nil }, set: { if !$0 { pendingRemoval = nil } })) {
                 Button("Remove Local Key", role: .destructive) {

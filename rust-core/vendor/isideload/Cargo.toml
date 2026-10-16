@@ -52,6 +52,9 @@ p12-keystore = { version = "0.3.0-rc4", package = "isideload-p12-keystore" }
 zip = { version = "8.3", default-features = false, features = ["deflate"] }
 apple-codesign-quick = "0.1.0"
 sha1 = "0.11.0"
+cms = "0.2.3"
+sha2_010 = { package = "sha2", version = "0.10.9", features = ["oid"] }
+sha1_010 = { package = "sha1", version = "0.10.6", features = ["oid"] }
 
 # There is a bug in rustls-platform-verifier that causes an invalid certificate error with apple's root cert.
 # It has been fixed already but I am waiting for a new release before I can update the dependency.
