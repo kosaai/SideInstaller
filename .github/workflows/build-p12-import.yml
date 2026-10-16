@@ -131,7 +131,7 @@ jobs:
         working-directory: rust-core
         run: |
           cargo test --locked -p isideload --lib
-          cargo check --locked -p isideload --example validate_imported_profiles
+          cargo build --locked -p isideload --example validate_imported_profiles
       - name: Validate production profile import and per-target matching with signing profiles
         working-directory: rust-core
         env:
@@ -151,7 +151,7 @@ jobs:
               if not value: raise SystemExit("Missing provisioning profile secret: " + name)
               Path(os.environ["FIXTURES"], filename).write_bytes(base64.b64decode(value, validate=True))
           PY
-          cargo run --locked -p isideload --example validate_imported_profiles -- "$FIXTURES/main.mobileprovision" "$FIXTURES/extension.mobileprovision" 6JKQ4V5NDG 00008150-0001358C36D9401C f4a0f130fa62b9aabdf960ff04c79d863cab038f7e41aef2637cbb1690d7b208 com.frizzlem.sideinstaller.6JKQ4V5NDG com.frizzlem.sideinstaller.6JKQ4V5NDG.LiveActivity "$FIXTURES/store"
+          target/debug/examples/validate_imported_profiles "$FIXTURES/main.mobileprovision" "$FIXTURES/extension.mobileprovision" 6JKQ4V5NDG 00008150-0001358C36D9401C f4a0f130fa62b9aabdf960ff04c79d863cab038f7e41aef2637cbb1690d7b208 com.frizzlem.sideinstaller.6JKQ4V5NDG com.frizzlem.sideinstaller.6JKQ4V5NDG.LiveActivity "$FIXTURES/store"
       - uses: actions/cache/save@v4
         if: always()
         with:

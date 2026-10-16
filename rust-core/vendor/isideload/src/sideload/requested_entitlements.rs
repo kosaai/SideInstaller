@@ -165,6 +165,15 @@ fn permits(allowed: &Value, requested: &Value) -> bool {
     }
 }
 
+fn has_wildcard(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s.contains('*'),
+        Value::Array(values) => values.iter().any(has_wildcard),
+        Value::Dictionary(values) => values.values().any(has_wildcard),
+        _ => false,
+    }
+}
+
 pub fn for_profile(
     profile: &ImportedProfile,
     requested: &Dictionary,
@@ -233,6 +242,10 @@ pub fn for_profile(
         }
         output.insert("keychain-access-groups".into(), group);
     }
+    // A wildcard in a profile is an authorization pattern, not a concrete
+    // capability to grant to the executable. Unrequested wildcard capabilities
+    // have no app-specific expansion and must not be blindly copied.
+    output.retain(|key, value| requested.contains_key(key) || !has_wildcard(value));
     Ok(output)
 }
 
@@ -259,5 +272,66 @@ mod tests {
         executable[16..20].copy_from_slice(&1u32.to_le_bytes());
         assert!(parse(&executable, 0).is_err());
         assert!(parse(b"broken", 0).is_err());
+    }
+
+    fn signed_executable(entitlements: &Dictionary) -> Vec<u8> {
+        let mut xml = Vec::new();
+        plist::to_writer_xml(&mut xml, entitlements).unwrap();
+        let mut blob = Vec::new();
+        for word in [
+            0xfade0cc0,
+            (28 + xml.len()) as u32,
+            1,
+            5,
+            20,
+            0xfade7171,
+            (8 + xml.len()) as u32,
+        ] {
+            blob.extend_from_slice(&word.to_be_bytes());
+        }
+        blob.extend_from_slice(&xml);
+        let mut macho = vec![0u8; 48];
+        for (at, value) in [
+            (0, 0xfeedfacfu32),
+            (16, 1),
+            (20, 16),
+            (32, 0x1d),
+            (36, 16),
+            (40, 48),
+            (44, blob.len() as u32),
+        ] {
+            macho[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        macho.extend_from_slice(&blob);
+        macho
+    }
+    #[test]
+    fn reads_signed_xml_and_fat_binary_entitlements_before_signing() {
+        let mut ent = Dictionary::new();
+        ent.insert("aps-environment".into(), "development".into());
+        let macho = signed_executable(&ent);
+        assert_eq!(parse(&macho, 0).unwrap(), ent);
+        let mut fat = Vec::new();
+        for word in [0xcafebabe, 1, 0x0100000c, 0, 28, macho.len() as u32, 0] {
+            fat.extend_from_slice(&word.to_be_bytes());
+        }
+        fat.extend_from_slice(&macho);
+        assert_eq!(parse(&fat, 0).unwrap(), ent);
+        fat[20..24].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(parse(&fat, 0).is_err());
+    }
+    #[test]
+    fn rejects_der_only_and_out_of_bounds_signature_data() {
+        let mut macho = signed_executable(&Dictionary::new());
+        macho[68..72].copy_from_slice(&0xfade7172u32.to_be_bytes());
+        assert!(
+            parse(&macho, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("DER-only")
+        );
+        let mut macho = signed_executable(&Dictionary::new());
+        macho[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse(&macho, 0).is_err());
     }
 }

@@ -646,6 +646,50 @@ pub(super) mod tests {
             "com.example.app.TESTTEAM01"
         );
     }
+
+    #[test]
+    fn exact_profile_wins_over_wildcard_and_unknown_bundle_can_fall_back() {
+        let (exact, cert) = fixture("com.example.app");
+        let mut wildcard = exact.clone();
+        wildcard.bundle_id = "com.example.*".into();
+        wildcard.uuid = uuid::Uuid::new_v4().to_string();
+        let profiles = vec![wildcard, exact.clone()];
+        assert_eq!(
+            select(
+                &profiles,
+                &exact.bundle_id,
+                "TESTTEAM01",
+                Some("TEST-UDID"),
+                &cert
+            )
+            .unwrap()
+            .unwrap()
+            .uuid,
+            exact.uuid
+        );
+        assert!(
+            select(
+                &profiles,
+                "com.example.widget",
+                "TESTTEAM01",
+                Some("TEST-UDID"),
+                &cert
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            select(
+                &profiles,
+                "com.other.app",
+                "TESTTEAM01",
+                Some("TEST-UDID"),
+                &cert
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
     #[test]
     fn entitlement_mismatch_is_explicit_and_profile_is_the_signing_basis() {
         let (p, _) = fixture("com.example.app");

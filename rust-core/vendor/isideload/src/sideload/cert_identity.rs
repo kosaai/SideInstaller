@@ -138,8 +138,12 @@ impl CertificateIdentity {
         let Some(private_key) = Self::load_private_key(apple_email, storage)? else {
             return Ok(None);
         };
+        let imported_certificate = storage.retrieve_data(&Self::certificate_path(apple_email))?;
         for cert in certs {
             let Some(content) = cert.cert_content.as_ref() else { continue };
+            // A renewed certificate can share the same public key. Respect the
+            // exact certificate selected by P12 import, not portal list order.
+            if imported_certificate.as_ref().is_some_and(|expected| expected.as_slice() != content.as_ref()) { continue; }
             if Self::key_matches(&private_key, content.as_ref())? {
                 let certificate = Certificate::from_der(content.as_ref())?;
                 if !Self::valid_for_team(&certificate, &team.team_id) { continue; }
@@ -351,6 +355,7 @@ mod imported_identity_tests {
         CertificateIdentity::bind_existing_key("test@example.invalid", &der,
             key.to_pkcs1_der().unwrap().as_bytes(), "TESTTEAM01", &[portal], &storage).unwrap();
         assert!(CertificateIdentity::has_local_key("test@example.invalid", &der, &storage).unwrap());
+        assert_eq!(CertificateIdentity::local_certificate("test@example.invalid", &storage).unwrap().as_deref(), Some(der.as_slice()));
     }
 
     #[test]
@@ -388,6 +393,7 @@ mod imported_identity_tests {
             key.to_pkcs1_der().unwrap().as_bytes(), "TESTTEAM01", &[portal.clone()], &storage).unwrap();
         CertificateIdentity::remove_local_key("test@example.invalid", &der, &storage).unwrap();
         assert!(!CertificateIdentity::has_local_key("test@example.invalid", &der, &storage).unwrap());
+        assert!(CertificateIdentity::local_certificate("test@example.invalid", &storage).unwrap().is_none());
         assert_eq!(portal.cert_content.unwrap().as_ref(), der.as_slice());
     }
 }
