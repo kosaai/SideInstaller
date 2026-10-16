@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   sign:
-    name: Sign SideInstallerQusai-P12Import.ipa
+    name: Sign SideInstallerQusai-P12Profiles.ipa
     runs-on: macos-14
     timeout-minutes: 30
     env:
@@ -48,27 +48,27 @@ jobs:
         with:
           script: |
             const owner = context.repo.owner, repo = context.repo.repo;
-            const {data: run} = await github.rest.actions.getWorkflowRun({owner, repo, run_id: 38887328939});
+            const {data: run} = await github.rest.actions.getWorkflowRun({owner, repo, run_id: 38896896867});
             if (run.conclusion !== 'success' || run.head_branch !== 'feature/import-existing-p12' ||
-                run.head_sha !== '9bd1b89c9b76813438f24c7c395e6e45e67d9467') {
+                run.head_sha !== 'bb53c1cfa501438a2945cd779e3f25ab30c65520') {
               throw new Error('Source run is not the verified modified SideInstaller build');
             }
-            const {data: artifact} = await github.rest.actions.getArtifact({owner, repo, artifact_id: 12040382251});
-            if (artifact.expired || artifact.name !== 'SideInstaller-P12Import' ||
-                artifact.workflow_run.id !== 38887328939 ||
-                artifact.digest !== 'sha256:ef6911330aad6d09f585850538e06fb7874d0f4777fc87e9d4362cbf73a9360d') {
+            const {data: artifact} = await github.rest.actions.getArtifact({owner, repo, artifact_id: 12044975609});
+            if (artifact.expired || artifact.name !== 'SideInstaller-P12Profiles' ||
+                artifact.workflow_run.id !== 38896896867 ||
+                artifact.digest !== 'sha256:6f2cc934431b08ddd2cb40b6fe4e6c42f0e707452dd59f3ef1062ad2b8f8c12b') {
               throw new Error('Modified IPA artifact is missing, expired or does not match its verified build');
             }
-            core.info('Verified source: SideInstaller-P12Import, run 38887328939, commit ' + run.head_sha);
+            core.info('Verified source: SideInstaller-P12Profiles, run 38896896867, commit ' + run.head_sha);
 
       - name: Download modified SideInstaller IPA artifact
         uses: actions/download-artifact@v4
         with:
-          artifact-ids: "12040382251"
+          artifact-ids: "12044975609"
           path: source-artifact
           github-token: ${{ github.token }}
           repository: kosaai/SideInstaller
-          run-id: "38887328939"
+          run-id: "38896896867"
 
       - name: Verify downloaded IPA checksum
         shell: bash
@@ -77,8 +77,8 @@ jobs:
           python3 <<'PY'
           import hashlib
           from pathlib import Path
-          source = Path("source-artifact/SideInstaller-P12Import.ipa")
-          checksum = Path("source-artifact/SideInstaller-P12Import.sha256")
+          source = Path("source-artifact/SideInstaller-P12Profiles.ipa")
+          checksum = Path("source-artifact/SideInstaller-P12Profiles.sha256")
           if not source.is_file() or not checksum.is_file():
               raise SystemExit("ERROR: Required modified IPA or checksum is missing from the source artifact")
           expected, filename = checksum.read_text().strip().split(maxsplit=1)
@@ -422,7 +422,7 @@ jobs:
               ["brew", "--prefix", "openssl@3"], text=True
           ).strip()) / "bin/openssl")
           SIGNING = Path("signing").resolve()
-          SOURCE = Path("source-artifact/SideInstaller-P12Import.ipa").resolve()
+          SOURCE = Path("source-artifact/SideInstaller-P12Profiles.ipa").resolve()
           WORK = Path(os.environ["RUNNER_TEMP"]) / "sideinstaller-work"
           NOW = datetime.datetime.now(datetime.timezone.utc)
           
@@ -450,7 +450,7 @@ jobs:
           
           
           if not SOURCE.is_file() or not SOURCE.stat().st_size:
-              fail("Source IPA source-artifact/SideInstaller-P12Import.ipa is missing or empty")
+              fail("Source IPA source-artifact/SideInstaller-P12Profiles.ipa is missing or empty")
           source_hash = sha256(SOURCE)
           print("Source IPA SHA256:", source_hash, flush=True)
           with zipfile.ZipFile(SOURCE) as archive:
@@ -818,7 +818,7 @@ jobs:
               fail("Source IPA changed during signing")
           print("ALL CODESIGN, CERTIFICATE, ENTITLEMENT AND PROFILE CHECKS PASSED", flush=True)
           
-          output = Path("SideInstallerQusai-P12Import.ipa").resolve()
+          output = Path("SideInstallerQusai-P12Profiles.ipa").resolve()
           output.unlink(missing_ok=True)
           run(["/usr/bin/zip", "-qry", output, "Payload", "-x", "*.DS_Store", "-x", "*/._*", "-x", "__MACOSX/*"], cwd=WORK)
           with zipfile.ZipFile(output) as archive:
@@ -827,7 +827,7 @@ jobs:
               if any(not n.startswith("Payload/") for n in archive.namelist()):
                   fail("Final IPA contains an unexpected parent directory")
           checksum = sha256(output)
-          Path("SideInstallerQusai-P12Import.sha256").write_text(checksum + "  SideInstallerQusai-P12Import.ipa" + chr(10))
+          Path("SideInstallerQusai-P12Profiles.sha256").write_text(checksum + "  SideInstallerQusai-P12Profiles.ipa" + chr(10))
           report = {
               "main_bundle_id": MAIN_ID,
               "liveactivity_bundle_id": LIVE_ID,
@@ -847,12 +847,12 @@ jobs:
                   summary.write("- **" + key + "**: " + str(value) + chr(10))
           PY
 
-      - name: Upload SideInstallerQusai-P12Import
+      - name: Upload SideInstallerQusai-P12Profiles
         uses: actions/upload-artifact@v4
         with:
-          name: SideInstallerQusai-P12Import
+          name: SideInstallerQusai-P12Profiles
           path: |
-            SideInstallerQusai-P12Import.ipa
-            SideInstallerQusai-P12Import.sha256
+            SideInstallerQusai-P12Profiles.ipa
+            SideInstallerQusai-P12Profiles.sha256
           if-no-files-found: error
           retention-days: 3
