@@ -1,0 +1,858 @@
+name: Sign SideInstaller P12 Import Qusai
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  sign:
+    name: Sign SideInstallerQusai-P12Import.ipa
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      TEAM_ID: "6JKQ4V5NDG"
+      EXPECTED_MAIN_BUNDLE_ID: "com.frizzlem.sideinstaller.6JKQ4V5NDG"
+      EXPECTED_LIVEACTIVITY_BUNDLE_ID: "com.frizzlem.sideinstaller.6JKQ4V5NDG.LiveActivity"
+      EXPECTED_CERTIFICATE_SUBJECT: "iPhone Developer: kosaai.70@gmail.com (UANMDYZB6T)"
+      EXPECTED_CERTIFICATE_SHA1: "04BF05E903299E9594040DE0A5610A48EF6D5973"
+      EXPECTED_CERTIFICATE_SHA256: "f4a0f130fa62b9aabdf960ff04c79d863cab038f7e41aef2637cbb1690d7b208"
+      TARGET_DEVICE_UDID: "00008150-0001358C36D9401C"
+      NORMALIZED_P12_PASSWORD: "Qusai-GHA-Temporary-P12-2026"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Check required signing secrets
+        env:
+          P12_BASE64: ${{ secrets.P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          SIDEINSTALLER_MAIN_PROFILE_BASE64: ${{ secrets.SIDEINSTALLER_MAIN_PROFILE_BASE64 }}
+          SIDEINSTALLER_LIVEACTIVITY_PROFILE_BASE64: ${{ secrets.SIDEINSTALLER_LIVEACTIVITY_PROFILE_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          required = ["P12_BASE64", "P12_PASSWORD", "SIDEINSTALLER_MAIN_PROFILE_BASE64", "SIDEINSTALLER_LIVEACTIVITY_PROFILE_BASE64"]
+          missing = [name for name in required if not os.environ.get(name, "")]
+          if missing:
+              for name in missing:
+                  print("::error::Missing GitHub Secret: " + name)
+              raise SystemExit("Missing required signing secrets: " + ", ".join(missing))
+          print("All four required signing secrets are available; values are not logged.")
+          PY
+
+      - name: Validate exact modified build artifact
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner, repo = context.repo.repo;
+            const {data: run} = await github.rest.actions.getWorkflowRun({owner, repo, run_id: 38887328939});
+            if (run.conclusion !== 'success' || run.head_branch !== 'feature/import-existing-p12' ||
+                run.head_sha !== '9bd1b89c9b76813438f24c7c395e6e45e67d9467') {
+              throw new Error('Source run is not the verified modified SideInstaller build');
+            }
+            const {data: artifact} = await github.rest.actions.getArtifact({owner, repo, artifact_id: 12040382251});
+            if (artifact.expired || artifact.name !== 'SideInstaller-P12Import' ||
+                artifact.workflow_run.id !== 38887328939 ||
+                artifact.digest !== 'sha256:ef6911330aad6d09f585850538e06fb7874d0f4777fc87e9d4362cbf73a9360d') {
+              throw new Error('Modified IPA artifact is missing, expired or does not match its verified build');
+            }
+            core.info('Verified source: SideInstaller-P12Import, run 38887328939, commit ' + run.head_sha);
+
+      - name: Download modified SideInstaller IPA artifact
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: "12040382251"
+          path: source-artifact
+          github-token: ${{ github.token }}
+          repository: kosaai/SideInstaller
+          run-id: "38887328939"
+
+      - name: Verify downloaded IPA checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import hashlib
+          from pathlib import Path
+          source = Path("source-artifact/SideInstaller-P12Import.ipa")
+          checksum = Path("source-artifact/SideInstaller-P12Import.sha256")
+          if not source.is_file() or not checksum.is_file():
+              raise SystemExit("ERROR: Required modified IPA or checksum is missing from the source artifact")
+          expected, filename = checksum.read_text().strip().split(maxsplit=1)
+          if filename.strip().lstrip("*") != source.name:
+              raise SystemExit("ERROR: Source checksum filename mismatch")
+          actual = hashlib.sha256(source.read_bytes()).hexdigest()
+          if actual.lower() != expected.lower():
+              raise SystemExit("ERROR: Modified source IPA checksum mismatch")
+          print("Modified source IPA SHA256:", actual)
+          PY
+
+      - name: Decode existing signing secrets
+        env:
+          P12_BASE64: ${{ secrets.P12_BASE64 }}
+          SIDEINSTALLER_MAIN_PROFILE_BASE64: ${{ secrets.SIDEINSTALLER_MAIN_PROFILE_BASE64 }}
+          SIDEINSTALLER_LIVEACTIVITY_PROFILE_BASE64: ${{ secrets.SIDEINSTALLER_LIVEACTIVITY_PROFILE_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p signing
+          python3 <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+          
+          files = {
+              "signing/original.p12": "P12_BASE64",
+              "signing/main.mobileprovision": "SIDEINSTALLER_MAIN_PROFILE_BASE64",
+              "signing/liveactivity.mobileprovision": "SIDEINSTALLER_LIVEACTIVITY_PROFILE_BASE64",
+          }
+          for output, secret in files.items():
+              value = os.environ.get(secret, "").strip()
+              if not value:
+                  raise SystemExit("ERROR: Missing GitHub Secret: " + secret)
+              try:
+                  data = base64.b64decode(value, validate=True)
+              except Exception:
+                  raise SystemExit("ERROR: Invalid Base64 in GitHub Secret: " + secret)
+              if not data:
+                  raise SystemExit("ERROR: Decoded secret is empty: " + secret)
+              Path(output).write_bytes(data)
+              print(output + ": decoded successfully")
+          PY
+
+      - name: Normalize old P12 safely
+        env:
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          if ! brew list openssl@3 >/dev/null 2>&1; then
+            brew install openssl@3
+          fi
+
+          OPENSSL_BIN="$(brew --prefix openssl@3)/bin/openssl"
+
+          echo "Using:"
+          "$OPENSSL_BIN" version
+
+          SOURCE_PASS="${P12_PASSWORD:-}"
+
+          if [ "$SOURCE_PASS" = "none" ]; then
+            SOURCE_PASS=""
+          fi
+
+          rm -f \
+            signing/p12-all.pem \
+            signing/private-key.pem \
+            signing/certificate.pem \
+            signing/certificate.der \
+            signing/normalized.p12
+
+          echo "Extracting original P12 without MAC verification..."
+
+          set +e
+
+          "$OPENSSL_BIN" pkcs12 \
+            -in signing/original.p12 \
+            -nodes \
+            -nomacver \
+            -passin "pass:${SOURCE_PASS}" \
+            -out signing/p12-all.pem
+
+          RESULT=$?
+
+          set -e
+
+          if [ "$RESULT" -ne 0 ]; then
+            echo "Normal extraction failed; retrying with legacy provider..."
+
+            "$OPENSSL_BIN" pkcs12 \
+              -legacy \
+              -in signing/original.p12 \
+              -nodes \
+              -nomacver \
+              -passin "pass:${SOURCE_PASS}" \
+              -out signing/p12-all.pem
+          fi
+
+          test -s signing/p12-all.pem
+
+          echo "Extracting private key..."
+
+          "$OPENSSL_BIN" pkey \
+            -in signing/p12-all.pem \
+            -out signing/private-key.pem
+
+          test -s signing/private-key.pem
+
+          echo "Extracting certificate..."
+
+          "$OPENSSL_BIN" x509 \
+            -in signing/p12-all.pem \
+            -out signing/certificate.pem
+
+          test -s signing/certificate.pem
+
+          "$OPENSSL_BIN" x509 \
+            -in signing/certificate.pem \
+            -outform DER \
+            -out signing/certificate.der
+
+          echo "Rebuilding Apple-compatible legacy temporary P12..."
+
+          "$OPENSSL_BIN" pkcs12 \
+            -export \
+            -legacy \
+            -keypbe PBE-SHA1-3DES \
+            -certpbe PBE-SHA1-3DES \
+            -macalg sha1 \
+            -inkey signing/private-key.pem \
+            -in signing/certificate.pem \
+            -name "Qusai SideInstaller Signing" \
+            -passout env:NORMALIZED_P12_PASSWORD \
+            -out signing/normalized.p12
+
+          test -s signing/normalized.p12
+
+          echo ""
+          echo "Certificate:"
+          "$OPENSSL_BIN" x509 \
+            -in signing/certificate.pem \
+            -noout \
+            -subject \
+            -issuer \
+            -serial \
+            -dates
+
+          echo ""
+          echo "Normalized P12 check:"
+
+          # Verify the MAC with the same password used for Keychain import.
+          # Do not use -nomacver for the rebuilt archive.
+          "$OPENSSL_BIN" pkcs12 \
+            -legacy \
+            -in signing/normalized.p12 \
+            -passin env:NORMALIZED_P12_PASSWORD \
+            -info \
+            -noout
+
+          # Round-trip both objects without printing any private material.
+          trap 'rm -f signing/normalized-check.pem signing/normalized-key-check.pem signing/normalized-certificate-check.der' EXIT
+
+          "$OPENSSL_BIN" pkcs12 \
+            -legacy \
+            -in signing/normalized.p12 \
+            -passin env:NORMALIZED_P12_PASSWORD \
+            -nodes \
+            -out signing/normalized-check.pem
+
+          "$OPENSSL_BIN" pkey \
+            -in signing/normalized-check.pem \
+            -check \
+            -noout
+
+          "$OPENSSL_BIN" pkey \
+            -in signing/normalized-check.pem \
+            -out signing/normalized-key-check.pem
+
+          "$OPENSSL_BIN" x509 \
+            -in signing/normalized-check.pem \
+            -outform DER \
+            -out signing/normalized-certificate-check.der
+
+          if ! cmp -s signing/private-key.pem signing/normalized-key-check.pem; then
+            echo "ERROR: Normalized P12 private key differs from the original"
+            exit 1
+          fi
+
+          if ! cmp -s signing/certificate.der signing/normalized-certificate-check.der; then
+            echo "ERROR: Normalized P12 certificate differs from the original"
+            exit 1
+          fi
+
+          echo "Normalized P12 MAC, private key and certificate: OK"
+          echo "Original private key and certificate preserved: YES"
+          echo "P12 normalization: OK"
+
+      - name: Import signing identity into temporary Keychain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/sideinstaller-qusai.keychain-db"
+          KEYCHAIN_PASSWORD="Qusai-Keychain-2026"
+
+          rm -f "$KEYCHAIN_PATH"
+
+          security create-keychain \
+            -p "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          security set-keychain-settings \
+            -lut 21600 \
+            "$KEYCHAIN_PATH"
+
+          security unlock-keychain \
+            -p "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          # codesign must be able to resolve the imported key through the
+          # user's search list, even when --keychain is supplied explicitly.
+          python3 - "$KEYCHAIN_PATH" <<'PY'
+          import shlex
+          import subprocess
+          import sys
+
+          keychain = sys.argv[1]
+          existing = shlex.split(subprocess.check_output(
+              ["security", "list-keychains", "-d", "user"],
+              text=True,
+          ))
+          search_list = [keychain] + [
+              path for path in existing if path != keychain
+          ]
+          subprocess.run(
+              ["security", "list-keychains", "-d", "user", "-s", *search_list],
+              check=True,
+          )
+          print("Temporary Keychain added to user search list")
+          PY
+
+          security import \
+            signing/normalized.p12 \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH" \
+            -P "$NORMALIZED_P12_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          echo "Available valid signing identities:"
+
+          security find-identity \
+            -v \
+            -p codesigning \
+            "$KEYCHAIN_PATH" \
+            > signing/codesigning-identities.txt
+
+          cat signing/codesigning-identities.txt
+
+          OPENSSL_BIN="$(brew --prefix openssl@3)/bin/openssl"
+
+          EXPECTED_IDENTITY="$(
+            "$OPENSSL_BIN" x509 \
+              -in signing/certificate.pem \
+              -noout \
+              -fingerprint \
+              -sha1 \
+              | cut -d= -f2 \
+              | tr -d ':' \
+              | tr '[:lower:]' '[:upper:]'
+          )"
+
+          IDENTITY="$(
+            awk -v expected="$EXPECTED_IDENTITY" \
+              '$2 == expected {print $2}' \
+              signing/codesigning-identities.txt
+          )"
+
+          if [ -z "$IDENTITY" ] || [ "$IDENTITY" != "$EXPECTED_IDENTITY" ]; then
+            echo "ERROR: Original P12 certificate is not a valid Keychain signing identity"
+            exit 1
+          fi
+
+          echo "Original certificate imported as a valid signing identity: YES"
+
+          echo "SIGNING_IDENTITY=$IDENTITY" \
+            >> "$GITHUB_ENV"
+
+          echo "SIGNING_KEYCHAIN=$KEYCHAIN_PATH" \
+            >> "$GITHUB_ENV"
+
+          echo "Using identity:"
+          echo "$IDENTITY"
+
+      - name: Decode Main and LiveActivity provisioning profiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          security cms -D -i signing/main.mobileprovision > signing/main-profile.plist
+          security cms -D -i signing/liveactivity.mobileprovision > signing/liveactivity-profile.plist
+          test -s signing/main-profile.plist
+          test -s signing/liveactivity-profile.plist
+
+      - name: Inspect IPA, validate profiles, sign and verify all targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import copy
+          import datetime
+          import fnmatch
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import plistlib
+          import shutil
+          import subprocess
+          import zipfile
+          
+          TEAM = os.environ["TEAM_ID"]
+          MAIN_ID = os.environ["EXPECTED_MAIN_BUNDLE_ID"]
+          LIVE_ID = os.environ["EXPECTED_LIVEACTIVITY_BUNDLE_ID"]
+          OLD_MAIN = "com.frizzlem.sideinstaller"
+          OLD_LIVE = "com.frizzlem.sideinstaller.LiveActivity"
+          CERT_SUBJECT = os.environ["EXPECTED_CERTIFICATE_SUBJECT"]
+          EXPECTED_SHA1 = os.environ["EXPECTED_CERTIFICATE_SHA1"]
+          EXPECTED_SHA256 = os.environ["EXPECTED_CERTIFICATE_SHA256"]
+          DEVICE = os.environ["TARGET_DEVICE_UDID"]
+          OPENSSL = str(Path(subprocess.check_output(
+              ["brew", "--prefix", "openssl@3"], text=True
+          ).strip()) / "bin/openssl")
+          SIGNING = Path("signing").resolve()
+          SOURCE = Path("source-artifact/SideInstaller-P12Import.ipa").resolve()
+          WORK = Path(os.environ["RUNNER_TEMP"]) / "sideinstaller-work"
+          NOW = datetime.datetime.now(datetime.timezone.utc)
+          
+          
+          def fail(message):
+              raise SystemExit("ERROR: " + message)
+          
+          
+          def run(args, **kwargs):
+              return subprocess.run([str(a) for a in args], check=True, **kwargs)
+          
+          
+          def read_plist(path):
+              with Path(path).open("rb") as stream:
+                  return plistlib.load(stream)
+          
+          
+          def write_plist(path, value):
+              with Path(path).open("wb") as stream:
+                  plistlib.dump(value, stream, fmt=plistlib.FMT_XML, sort_keys=False)
+          
+          
+          def sha256(path):
+              return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+          
+          
+          if not SOURCE.is_file() or not SOURCE.stat().st_size:
+              fail("Source IPA source-artifact/SideInstaller-P12Import.ipa is missing or empty")
+          source_hash = sha256(SOURCE)
+          print("Source IPA SHA256:", source_hash, flush=True)
+          with zipfile.ZipFile(SOURCE) as archive:
+              corrupt = archive.testzip()
+              if corrupt:
+                  fail("Source IPA has a corrupt ZIP entry: " + corrupt)
+              for entry in archive.infolist():
+                  path = Path(entry.filename)
+                  if path.is_absolute() or ".." in path.parts:
+                      fail("Invalid path inside source IPA: " + entry.filename)
+          if WORK.exists():
+              shutil.rmtree(WORK)
+          WORK.mkdir(parents=True)
+          run(["/usr/bin/unzip", "-q", SOURCE, "-d", WORK])
+          apps = sorted(p for p in (WORK / "Payload").glob("*.app") if p.is_dir())
+          if len(apps) != 1:
+              fail("Expected exactly one Payload/*.app; found " + str(len(apps)))
+          app = apps[0]
+          extensions = sorted((app / "PlugIns").glob("*.appex"))
+          original_entitlements = {}
+          
+          
+          def extract_entitlements(path):
+              result = subprocess.run(
+                  ["codesign", "-d", "--entitlements", ":-", str(path)],
+                  capture_output=True,
+              )
+              if result.returncode:
+                  diagnostic = result.stderr.decode(errors="replace")
+                  if "not signed at all" in diagnostic:
+                      print("No original signature:", path.name)
+                      return {}
+                  fail("Cannot inspect original signature for " + str(path) + ": " + diagnostic)
+              if not result.stdout.strip():
+                  return {}
+              value = plistlib.loads(result.stdout)
+              if not isinstance(value, dict):
+                  fail("Original entitlements are not a dictionary: " + str(path))
+              return value
+          
+          
+          for target in [app, *extensions]:
+              info = read_plist(target / "Info.plist")
+              print()
+              print("ORIGINAL TARGET:", target.relative_to(WORK))
+              for key in ["CFBundleIdentifier", "CFBundleExecutable", "CFBundleVersion", "CFBundleShortVersionString"]:
+                  print(key + ":", info.get(key))
+              original_entitlements[str(target)] = extract_entitlements(target)
+              print("Original entitlements:")
+              print(plistlib.dumps(original_entitlements[str(target)]).decode())
+          if read_plist(app / "Info.plist").get("CFBundleIdentifier") != OLD_MAIN:
+              fail("Unexpected original Main Bundle ID")
+          live_candidates = [p for p in extensions if read_plist(p / "Info.plist").get("CFBundleIdentifier") == OLD_LIVE]
+          if len(live_candidates) != 1:
+              fail("Expected one LiveActivity extension with Bundle ID " + OLD_LIVE)
+          live = live_candidates[0]
+          if len(extensions) != 1:
+              fail("Additional extensions require their own existing matching provisioning profiles")
+          print("Discovered LiveActivity extension:", live.relative_to(WORK))
+          
+          # Pin the exact certificate from the successful SideStore run, not just its name.
+          certificate = (SIGNING / "certificate.der").read_bytes()
+          cert_sha1 = hashlib.sha1(certificate).hexdigest().upper()
+          cert_sha256 = hashlib.sha256(certificate).hexdigest()
+          subject = subprocess.check_output([
+              OPENSSL, "x509", "-in", str(SIGNING / "certificate.pem"),
+              "-noout", "-subject", "-nameopt", "utf8",
+          ], text=True).strip()
+          print()
+          print("Certificate Subject:", subject)
+          print("Certificate SHA1:", cert_sha1)
+          print("Certificate SHA256:", cert_sha256)
+          print("Certificate Team ID:", TEAM)
+          if cert_sha1 != EXPECTED_SHA1 or cert_sha256 != EXPECTED_SHA256:
+              fail("P12 certificate differs from the required successful SideStore certificate")
+          if CERT_SUBJECT not in subject or ("OU=" + TEAM) not in subject:
+              fail("Certificate subject or Team ID does not match")
+          if os.environ["SIGNING_IDENTITY"] != cert_sha1:
+              fail("Imported signing identity differs from the verified certificate")
+          run([OPENSSL, "x509", "-in", SIGNING / "certificate.pem", "-checkend", "0", "-noout"])
+          
+          
+          def inspect_profile(label, basename, expected_id):
+              profile = read_plist(SIGNING / (basename + "-profile.plist"))
+              entitlements = profile.get("Entitlements", {})
+              certificates = profile.get("DeveloperCertificates", [])
+              expiry = profile.get("ExpirationDate")
+              if expiry is not None:
+                  expiry = expiry.replace(tzinfo=datetime.timezone.utc) if expiry.tzinfo is None else expiry.astimezone(datetime.timezone.utc)
+              print()
+              print("PROFILE:", label)
+              for key in ["Name", "UUID", "TeamIdentifier", "ApplicationIdentifierPrefix", "ExpirationDate", "ProvisionedDevices", "ProvisionsAllDevices"]:
+                  print(key + ":", profile.get(key))
+              print("application-identifier:", entitlements.get("application-identifier"))
+              print("DeveloperCertificates SHA1:", [hashlib.sha1(c).hexdigest().upper() for c in certificates])
+              print("DeveloperCertificates SHA256:", [hashlib.sha256(c).hexdigest() for c in certificates])
+              print("Profile Entitlements:")
+              print(plistlib.dumps(entitlements).decode())
+              if not profile.get("Name") or not profile.get("UUID"):
+                  fail(label + ": profile Name or UUID is missing")
+              if profile.get("TeamIdentifier") != [TEAM]:
+                  fail(label + ": TeamIdentifier does not match " + TEAM)
+              if entitlements.get("application-identifier") != TEAM + "." + expected_id:
+                  fail(label + ": application-identifier does not match the required final Bundle ID")
+              if entitlements.get("com.apple.developer.team-identifier") != TEAM:
+                  fail(label + ": entitlement Team ID mismatch")
+              if expiry is None or expiry <= NOW:
+                  fail(label + ": provisioning profile is expired or has no expiration date")
+              if certificate not in certificates:
+                  fail(label + ": profile does not include the required signing certificate")
+              if "ProvisionedDevices" in profile:
+                  if DEVICE not in profile["ProvisionedDevices"]:
+                      fail(label + ": profile does not cover the target iPhone " + DEVICE)
+              elif not profile.get("ProvisionsAllDevices", False):
+                  fail(label + ": profile does not permit direct installation on the target iPhone")
+              print(label + " profile/certificate/device validation: OK")
+              return profile, expiry.isoformat()
+          
+          
+          main_profile, main_expiry = inspect_profile("Main", "main", MAIN_ID)
+          live_profile, live_expiry = inspect_profile("LiveActivity", "liveactivity", LIVE_ID)
+          
+          
+          def map_bundle(value):
+              for old, new in [(OLD_LIVE, LIVE_ID), (OLD_MAIN, MAIN_ID)]:
+                  if value == old or value.startswith(old + "."):
+                      return new + value[len(old):]
+              return value
+          
+          
+          def permitted(value, grant):
+              if isinstance(value, str) and isinstance(grant, str):
+                  return fnmatch.fnmatchcase(value, grant)
+              if isinstance(value, list) and isinstance(grant, list):
+                  return all(any(permitted(v, g) for g in grant) for v in value)
+              if isinstance(value, dict) and isinstance(grant, dict):
+                  return all(k in grant and permitted(v, grant[k]) for k, v in value.items())
+              return type(value) is type(grant) and value == grant
+          
+          
+          def build_entitlements(target, profile, final_id, label):
+              requested = original_entitlements[str(target)]
+              allowed = profile["Entitlements"]
+              final = {}
+              rewrites = {}
+              prefix = allowed["application-identifier"].split(".", 1)[0]
+              old_prefix = requested.get("application-identifier", "").split(".", 1)[0]
+              managed = {"application-identifier", "com.apple.developer.team-identifier", "get-task-allow", "aps-environment"}
+          
+              def has_wildcard(value):
+                  if isinstance(value, str):
+                      return "*" in value
+                  if isinstance(value, list):
+                      return any(has_wildcard(v) for v in value)
+                  if isinstance(value, dict):
+                      return any(has_wildcard(v) for v in value.values())
+                  return False
+          
+              # The source IPA is unsigned. Use concrete capabilities from its
+              # supplied profile, including the authorized shared App Group.
+              if not requested:
+                  for key, grant in allowed.items():
+                      if key not in managed and key != "keychain-access-groups" and not has_wildcard(grant):
+                          final[key] = copy.deepcopy(grant)
+                  print(label + ": unsigned source; using concrete profile-authorized capabilities")
+          
+              def choose(key, value, grant):
+                  if isinstance(value, list):
+                      if not isinstance(grant, list):
+                          fail(label + ": entitlement type mismatch for " + key)
+                      selected = []
+                      for item in value:
+                          candidate = choose(key, item, grant)
+                          if candidate not in selected:
+                              selected.append(candidate)
+                      return selected
+                  grants = grant if isinstance(grant, list) else [grant]
+                  candidates = [value]
+                  if isinstance(value, str):
+                      mapped = map_bundle(value)
+                      if mapped != value:
+                          candidates.append(mapped)
+                      if value.startswith("group."):
+                          candidates.append("group." + map_bundle(value[len("group."):]))
+                      if key == "keychain-access-groups":
+                          suffix = value.split(".", 1)[1] if "." in value else final_id
+                          if old_prefix and value.startswith(old_prefix + "."):
+                              candidates.append(prefix + "." + map_bundle(suffix))
+                              candidates.append(prefix + "." + suffix)
+                          if "*" in value:
+                              candidates = [prefix + "." + final_id]
+                      if key.startswith("com.apple.developer.") and old_prefix and value.startswith(old_prefix + "."):
+                          candidates.append(prefix + "." + map_bundle(value[len(old_prefix) + 1:]))
+                  for candidate in candidates:
+                      if any(permitted(candidate, g) for g in grants):
+                          if isinstance(candidate, str) and "*" in candidate:
+                              fail(label + ": unresolved wildcard in signed entitlement " + key)
+                          if candidate != value:
+                              rewrites[value] = candidate
+                              print(label + " authorized entitlement mapping:", key, value, "->", candidate)
+                          return copy.deepcopy(candidate)
+                  fail(label + ": required original entitlement is not allowed by its profile: " + key + " = " + repr(value))
+          
+              for key, value in requested.items():
+                  if key in managed:
+                      continue
+                  if key not in allowed:
+                      fail(label + ": original entitlement is absent from the supplied profile: " + key)
+                  final[key] = choose(key, value, allowed[key])
+              for key in ["application-identifier", "com.apple.developer.team-identifier", "get-task-allow"]:
+                  if key in allowed:
+                      final[key] = copy.deepcopy(allowed[key])
+                  elif key in requested:
+                      fail(label + ": required managed entitlement is missing: " + key)
+              if "aps-environment" in requested:
+                  if "aps-environment" not in allowed:
+                      fail(label + ": original push notification entitlement is not permitted")
+                  final["aps-environment"] = allowed["aps-environment"]
+              if "keychain-access-groups" not in final and "keychain-access-groups" in allowed:
+                  group = prefix + "." + final_id
+                  if permitted([group], allowed["keychain-access-groups"]):
+                      final["keychain-access-groups"] = [group]
+              if final.get("application-identifier") != TEAM + "." + final_id:
+                  fail(label + ": final application-identifier mismatch")
+              for key, value in final.items():
+                  if key not in allowed or not permitted(value, allowed[key]):
+                      fail(label + ": final entitlement exceeds profile permission: " + key)
+              destination = SIGNING / (label.lower() + "-entitlements.plist")
+              write_plist(destination, final)
+              print(label + " prepared entitlements:")
+              print(plistlib.dumps(final).decode())
+              return final, destination, rewrites
+          
+          
+          main_ent, main_ent_path, main_rewrites = build_entitlements(app, main_profile, MAIN_ID, "Main")
+          live_ent, live_ent_path, live_rewrites = build_entitlements(live, live_profile, LIVE_ID, "LiveActivity")
+          for capability in ["com.apple.security.application-groups", "keychain-access-groups"]:
+              shared_original = set(original_entitlements[str(app)].get(capability, [])) & set(original_entitlements[str(live)].get(capability, []))
+              if shared_original and not (set(main_ent.get(capability, [])) & set(live_ent.get(capability, []))):
+                  fail("Profiles cannot preserve the original shared " + capability)
+          
+          # Only structured Info.plist values are changed; binaries are never patched.
+          for info_path in sorted(app.rglob("Info.plist")):
+              if info_path.is_symlink():
+                  continue
+              info = read_plist(info_path)
+              is_live = live == info_path.parent or live in info_path.parents
+              rewrites = live_rewrites if is_live else main_rewrites
+          
+              def update(value, keys=()):
+                  if isinstance(value, dict):
+                      return {k: update(v, keys + (k,)) for k, v in value.items()}
+                  if isinstance(value, list):
+                      return [update(v, keys) for v in value]
+                  if isinstance(value, str):
+                      # Document UTIs, URL schemes and background task names
+                      # are API contracts used by the existing executable, not
+                      # signing identities. Keep them consistent with the binary.
+                      stable_keys = {
+                          "UTExportedTypeDeclarations", "UTImportedTypeDeclarations",
+                          "LSItemContentTypes", "UTTypeIdentifier", "CFBundleURLSchemes",
+                          "BGTaskSchedulerPermittedIdentifiers", "CFBundleExecutable",
+                          "CFBundleName", "CFBundleDisplayName", "CFBundleVersion",
+                          "CFBundleShortVersionString",
+                      }
+                      replacement = value if any(k in stable_keys for k in keys) else rewrites.get(value, map_bundle(value))
+                      if replacement != value:
+                          print("Info.plist reference:", info_path.relative_to(WORK), "/".join(keys), value, "->", replacement)
+                      elif OLD_MAIN in value:
+                          print("Reviewed unchanged Info.plist reference:", info_path.relative_to(WORK), "/".join(keys), value)
+                      return replacement
+                  return value
+          
+              updated = update(info)
+              if info_path == app / "Info.plist":
+                  updated["CFBundleIdentifier"] = MAIN_ID
+              elif info_path == live / "Info.plist":
+                  updated["CFBundleIdentifier"] = LIVE_ID
+              if updated != info:
+                  write_plist(info_path, updated)
+          
+          for target, basename in [(app, "main"), (live, "liveactivity")]:
+              shutil.copyfile(SIGNING / (basename + ".mobileprovision"), target / "embedded.mobileprovision")
+          
+          # Collect executable bundles and Mach-O objects; always sign children first.
+          def bundle_executable(bundle):
+              paths = [bundle / "Info.plist", bundle / "Resources/Info.plist", bundle / "Contents/Info.plist"]
+              for info_path in paths:
+                  if info_path.is_file():
+                      executable = read_plist(info_path).get("CFBundleExecutable")
+                      if executable:
+                          for candidate in [bundle / executable, bundle / "Contents/MacOS" / executable]:
+                              if candidate.is_file():
+                                  return candidate.resolve()
+              if bundle.suffix == ".framework" and (bundle / bundle.stem).is_file():
+                  return (bundle / bundle.stem).resolve()
+              return None
+          
+          
+          nested_bundles = []
+          for path in app.rglob("*"):
+              if path.is_dir() and not path.is_symlink() and path not in [app, live] and path.suffix in [".framework", ".bundle", ".xpc", ".app", ".appex"]:
+                  if path.suffix in [".app", ".appex", ".xpc"]:
+                      fail("Additional executable target needs its own existing profile: " + str(path))
+                  if bundle_executable(path) is not None:
+                      nested_bundles.append(path)
+          managed_executables = {p for p in (bundle_executable(b) for b in [app, live, *nested_bundles]) if p is not None}
+          macho_magic = {bytes.fromhex(h) for h in ["feedface", "cefaedfe", "feedfacf", "cffaedfe", "cafebabe", "bebafeca", "cafebabf", "bfbafeca"]}
+          loose_code = []
+          for path in app.rglob("*"):
+              if not path.is_file() or path.is_symlink() or path.resolve() in managed_executables:
+                  continue
+              with path.open("rb") as stream:
+                  magic = stream.read(4)
+              if magic in macho_magic:
+                  loose_code.append(path)
+          nested = sorted(set(nested_bundles + loose_code), key=lambda p: (-len(p.parts), str(p)))
+          print()
+          print("Nested signing order:")
+          for path in nested:
+              print(path.relative_to(WORK))
+          
+          
+          def sign(target, entitlements=None):
+              print("SIGN:", target.relative_to(WORK), flush=True)
+              args = ["codesign", "--force", "--sign", os.environ["SIGNING_IDENTITY"], "--keychain", os.environ["SIGNING_KEYCHAIN"], "--timestamp=none"]
+              if entitlements is not None:
+                  args.extend(["--entitlements", str(entitlements), "--generate-entitlement-der"])
+              run(args + [str(target)])
+          
+          
+          for target in nested:
+              sign(target)
+          sign(live, live_ent_path)
+          sign(app, main_ent_path)
+          
+          # Verify every signed object and compare its actual leaf certificate.
+          for index, target in enumerate([*nested, live, app]):
+              print("VERIFY:", target.relative_to(WORK), flush=True)
+              run(["codesign", "--verify", "--strict", "--verbose=4", target])
+              prefix = SIGNING / ("verified-certificate-" + str(index) + "-")
+              run(["codesign", "-d", "--extract-certificates=" + str(prefix), target])
+              if sha256(str(prefix) + "0") != cert_sha256:
+                  fail("Signed target uses a different certificate: " + str(target))
+          run(["codesign", "--verify", "--deep", "--strict", "--verbose=4", app])
+          for target, expected_id, profile, entitlements in [(app, MAIN_ID, main_profile, main_ent), (live, LIVE_ID, live_profile, live_ent)]:
+              if read_plist(target / "Info.plist").get("CFBundleIdentifier") != expected_id:
+                  fail("Final CFBundleIdentifier mismatch: " + str(target))
+              final_xml = subprocess.check_output(["codesign", "-d", "--entitlements", ":-", str(target)])
+              print()
+              print("FINAL ENTITLEMENTS:", target.relative_to(WORK))
+              print(final_xml.decode())
+              if plistlib.loads(final_xml) != entitlements:
+                  fail("Signed entitlements differ from validated entitlements: " + str(target))
+              embedded_xml = subprocess.check_output(["security", "cms", "-D", "-i", str(target / "embedded.mobileprovision")])
+              embedded = plistlib.loads(embedded_xml)
+              if embedded != profile or embedded["Entitlements"]["application-identifier"] != TEAM + "." + expected_id:
+                  fail("Embedded provisioning profile does not match its final target: " + str(target))
+              if certificate not in embedded["DeveloperCertificates"]:
+                  fail("Embedded provisioning profile does not contain the actual signing certificate")
+              print("Final Bundle ID:", expected_id)
+              print("Embedded profile UUID:", embedded["UUID"])
+              print("Target signature/profile/entitlements verification: OK")
+          if sha256(SOURCE) != source_hash:
+              fail("Source IPA changed during signing")
+          print("ALL CODESIGN, CERTIFICATE, ENTITLEMENT AND PROFILE CHECKS PASSED", flush=True)
+          
+          output = Path("SideInstallerQusai-P12Import.ipa").resolve()
+          output.unlink(missing_ok=True)
+          run(["/usr/bin/zip", "-qry", output, "Payload", "-x", "*.DS_Store", "-x", "*/._*", "-x", "__MACOSX/*"], cwd=WORK)
+          with zipfile.ZipFile(output) as archive:
+              if archive.testzip() is not None:
+                  fail("Final IPA ZIP integrity check failed")
+              if any(not n.startswith("Payload/") for n in archive.namelist()):
+                  fail("Final IPA contains an unexpected parent directory")
+          checksum = sha256(output)
+          Path("SideInstallerQusai-P12Import.sha256").write_text(checksum + "  SideInstallerQusai-P12Import.ipa" + chr(10))
+          report = {
+              "main_bundle_id": MAIN_ID,
+              "liveactivity_bundle_id": LIVE_ID,
+              "certificate_subject": CERT_SUBJECT,
+              "certificate_sha1": cert_sha1,
+              "certificate_sha256": cert_sha256,
+              "main_profile_expiration": main_expiry,
+              "liveactivity_profile_expiration": live_expiry,
+              "verification": "PASS: all targets, nested code, certificates, entitlements and embedded profiles",
+              "filename": output.name,
+              "sha256": checksum,
+          }
+          print("RESULT_JSON: " + json.dumps(report, ensure_ascii=False), flush=True)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("## SideInstaller signing: PASS" + chr(10) * 2)
+              for key, value in report.items():
+                  summary.write("- **" + key + "**: " + str(value) + chr(10))
+          PY
+
+      - name: Upload SideInstallerQusai-P12Import
+        uses: actions/upload-artifact@v4
+        with:
+          name: SideInstallerQusai-P12Import
+          path: |
+            SideInstallerQusai-P12Import.ipa
+            SideInstallerQusai-P12Import.sha256
+          if-no-files-found: error
+          retention-days: 3
