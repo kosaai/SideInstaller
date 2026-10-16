@@ -1,6 +1,6 @@
 use apple_codesign_quick::ProvisioningProfile;
 use hex::ToHex;
-use rootcause::{option_ext::OptionExt, prelude::*};
+use rootcause::prelude::*;
 use rsa::{
     RsaPrivateKey,
     pkcs1::{DecodeRsaPrivateKey, EncodeRsaPublicKey},
@@ -119,10 +119,10 @@ impl CertificateIdentity {
         storage: &dyn SideloadingStorage,
         _max_certs_behavior: &MaxCertsBehavior,
     ) -> Result<Self, Report> {
-        Self::retrieve_existing(machine_name, apple_email, developer_session, team, storage)
+        Ok(Self::retrieve_existing(machine_name, apple_email, developer_session, team, storage)
             .await?
             .ok_or_else(|| report!(SideloadError::DeveloperError(7460,
-                "This certificate exists on Apple, but its private key is not available on this device. Import its P12/PFX file.".into())))
+                "This certificate exists on Apple, but its private key is not available on this device. Import its P12/PFX file.".into())))?)
     }
 
     pub async fn retrieve_existing(

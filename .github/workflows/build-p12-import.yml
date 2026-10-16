@@ -13,7 +13,7 @@ permissions:
   contents: read
 concurrency:
   group: p12-import-build
-  cancel-in-progress: true
+  cancel-in-progress: false
 jobs:
   build:
     runs-on: macos-15
@@ -48,6 +48,8 @@ jobs:
           restore-keys: p12-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}-
       - name: Swift syntax lint
         run: swiftc -frontend -parse ios-app/P12Importer.swift ios-app/SigningKeychain.swift ios-app/P12ImportPresenter.swift ios-app/CertManager.swift ios-app/CertsView.swift
+      - name: Swift iOS typecheck
+        run: xcrun swiftc -swift-version 5 -typecheck -target arm64-apple-ios17.4 -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" -I rust-core/include ios-app/*.swift
       - name: Rust signing lint and typecheck
         working-directory: rust-core
         run: cargo clippy --locked --release --target aarch64-apple-ios --lib
