@@ -24,6 +24,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          sparse-checkout: |
+            ios-app
+            ios-live-activity
+            rust-core
+            tests
       - name: Select latest installed Xcode
         run: |
           XCODE=$(find /Applications -maxdepth 1 -name 'Xcode*.app' | sort -V | tail -1)
@@ -85,3 +90,32 @@ jobs:
             ~/.cargo/git
             rust-core/target
           key: p12-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}-${{ github.sha }}
+
+  identity-tests:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            rust-core
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: p12-test-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: p12-test-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}-
+      - name: Test identity reuse, missing keys, team matching and local-only removal
+        working-directory: rust-core
+        run: cargo test --locked -p isideload --lib imported_identity_tests
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: p12-test-${{ runner.arch }}-${{ hashFiles('rust-core/Cargo.lock') }}-${{ github.sha }}

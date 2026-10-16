@@ -272,6 +272,12 @@ impl CertificateIdentity {
         team: &DeveloperTeam,
         storage: &dyn SideloadingStorage,
     ) -> Result<(), Report> {
+        let certs = developer_session.list_ios_certs(team).await?;
+        Self::bind_existing_key(apple_email, certificate_der, private_key_pkcs1, &team.team_id, &certs, storage)
+    }
+
+    fn bind_existing_key(apple_email: &str, certificate_der: &[u8], private_key_pkcs1: &[u8],
+                         team_id: &str, certs: &[DevelopmentCertificate], storage: &dyn SideloadingStorage) -> Result<(), Report> {
         let key = RsaPrivateKey::from_pkcs1_der(private_key_pkcs1)
             .context("The signing engine requires an RSA private key")?;
         key.validate().context("Invalid signing key")?;
@@ -279,10 +285,9 @@ impl CertificateIdentity {
             bail!("The private key does not match the selected certificate.");
         }
         let cert = Certificate::from_der(certificate_der)?;
-        if !Self::valid_for_team(&cert, &team.team_id) {
+        if !Self::valid_for_team(&cert, team_id) {
             bail!("Certificate is expired, not yet valid, or belongs to a different team.");
         }
-        let certs = developer_session.list_ios_certs(team).await?;
         if !certs.iter().any(|c| c.cert_content.as_ref().is_some_and(|data| data.as_ref() == certificate_der)) {
             bail!("The imported certificate was not found on this Apple developer team. Check the selected account.");
         }
@@ -297,5 +302,76 @@ impl CertificateIdentity {
             storage.delete(&Self::key_path(apple_email))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod imported_identity_tests {
+    use super::*;
+    use rsa::pkcs1::EncodeRsaPrivateKey;
+    use rsa::pkcs8::LineEnding;
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_RSA_SHA256};
+    use crate::util::storage::InMemoryStorage;
+
+    fn fixture() -> (RsaPrivateKey, Vec<u8>, DevelopmentCertificate) {
+        let key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let signer = KeyPair::from_pkcs8_pem_and_sign_algo(&key.to_pkcs8_pem(LineEnding::LF).unwrap(), &PKCS_RSA_SHA256).unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        let mut name = DistinguishedName::new();
+        name.push(DnType::CommonName, "Synthetic test certificate");
+        name.push(DnType::OrganizationalUnitName, "TESTTEAM01");
+        params.distinguished_name = name;
+        let der = params.self_signed(&signer).unwrap().der().to_vec();
+        let mut portal: DevelopmentCertificate = serde_json::from_str("{}").unwrap();
+        portal.machine_name = Some("A different computer".into());
+        portal.cert_content = Some(plist::Data::new(der.clone()));
+        (key, der, portal)
+    }
+
+    #[test]
+    fn imported_key_matches_apple_certificate_from_another_machine() {
+        let (key, der, portal) = fixture();
+        let storage = InMemoryStorage::new();
+        CertificateIdentity::bind_existing_key("test@example.invalid", &der,
+            key.to_pkcs1_der().unwrap().as_bytes(), "TESTTEAM01", &[portal], &storage).unwrap();
+        assert!(CertificateIdentity::has_local_key("test@example.invalid", &der, &storage).unwrap());
+    }
+
+    #[test]
+    fn missing_key_is_not_generated_and_wrong_account_cannot_reuse_it() {
+        let (_, der, _) = fixture();
+        let storage = InMemoryStorage::new();
+        assert!(!CertificateIdentity::has_local_key("missing@example.invalid", &der, &storage).unwrap());
+        assert!(storage.retrieve_data(&CertificateIdentity::key_path("missing@example.invalid")).unwrap().is_none());
+    }
+
+    #[test]
+    fn mismatch_or_absent_apple_certificate_cannot_overwrite_key() {
+        let (key, der, portal) = fixture();
+        let (wrong, _, _) = fixture();
+        let storage = InMemoryStorage::new();
+        assert!(CertificateIdentity::bind_existing_key("test@example.invalid", &der,
+            wrong.to_pkcs1_der().unwrap().as_bytes(), "TESTTEAM01", &[portal], &storage).is_err());
+        assert!(CertificateIdentity::bind_existing_key("test@example.invalid", &der,
+            key.to_pkcs1_der().unwrap().as_bytes(), "TESTTEAM01", &[], &storage).is_err());
+        assert!(CertificateIdentity::load_private_key("test@example.invalid", &storage).unwrap().is_none());
+    }
+
+    #[test]
+    fn wrong_team_is_rejected() {
+        let (key, der, portal) = fixture();
+        assert!(CertificateIdentity::bind_existing_key("test@example.invalid", &der,
+            key.to_pkcs1_der().unwrap().as_bytes(), "OTHERTEAM1", &[portal], &InMemoryStorage::new()).is_err());
+    }
+
+    #[test]
+    fn removing_local_key_only_changes_local_storage() {
+        let (key, der, portal) = fixture();
+        let storage = InMemoryStorage::new();
+        CertificateIdentity::bind_existing_key("test@example.invalid", &der,
+            key.to_pkcs1_der().unwrap().as_bytes(), "TESTTEAM01", &[portal.clone()], &storage).unwrap();
+        CertificateIdentity::remove_local_key("test@example.invalid", &der, &storage).unwrap();
+        assert!(!CertificateIdentity::has_local_key("test@example.invalid", &der, &storage).unwrap());
+        assert_eq!(portal.cert_content.unwrap().as_ref(), der.as_slice());
     }
 }
