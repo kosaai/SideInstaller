@@ -66,6 +66,7 @@ jobs:
         with:
           artifact-ids: "12044975609"
           path: source-artifact
+          merge-multiple: true
           github-token: ${{ github.token }}
           repository: kosaai/SideInstaller
           run-id: "38896896867"
