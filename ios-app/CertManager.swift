@@ -12,6 +12,7 @@ struct DevCert: Identifiable, Decodable, Equatable {
     let platform: String
     let status: String
     /// RFC3339 expiry (e.g. `2027-01-01T00:00:00Z`), or "" if Apple omitted it.
+    let hasPrivateKey: Bool
     let expiration: String
 
     enum CodingKeys: String, CodingKey {
@@ -23,6 +24,7 @@ struct DevCert: Identifiable, Decodable, Equatable {
         case platform
         case status
         case expiration
+        case hasPrivateKey = "has_private_key"
     }
 
     /// Stable identity: the serial revocation keys on, or the certificate id.
@@ -66,6 +68,9 @@ final class CertManager: ObservableObject {
     @Published var lastError: String?
     /// True once a list has been fetched (tells "not loaded" apart from "empty").
     @Published private(set) var hasLoaded = false
+
+    @Published var showP12Importer = false
+    @Published private(set) var importSummary: String?
 
     private var session: OpaquePointer?            // CertSession*
     private let queue = DispatchQueue(label: "sideinstaller.certs")
@@ -188,6 +193,92 @@ final class CertManager: ObservableObject {
         didAutoLoad = false
         lastError = nil
         engine.log("Certificates: signed out.")
+    }
+
+    /// The selected URL stays security-scoped only while it is read. PKCS#12
+    /// bytes and password are never copied to persistent app storage.
+    @MainActor
+    func importP12(from url: URL, password: String) {
+        guard !isWorking, revokingID == nil, !engine.isRunning else { return }
+        let id = engine.normalizedAppleID, pw = engine.applePassword
+        guard !id.isEmpty, !pw.isEmpty else {
+            lastError = "Add your Apple ID in Settings › Account before importing its certificate."
+            return
+        }
+        isWorking = true
+        lastError = nil
+        importSummary = nil
+        Task { @MainActor in
+            do {
+                // Decode and verify the key pair before any portal operation.
+                var imported = try await onQueue {
+                    let scoped = url.startAccessingSecurityScopedResource()
+                    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                    let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+                    guard size <= 4 * 1024 * 1024 else { throw P12Importer.ImportError.invalid }
+                    var data = try Data(contentsOf: url)
+                    defer { data.resetBytes(in: 0..<data.count) }
+                    return try P12Importer.decode(data, password: password)
+                }
+                defer { imported.clearKey() }
+                if session == nil { try await signIn(id: id, pw: pw) }
+                // Refresh + full DER matching on the selected team happens in
+                // this FFI call before the Keychain accepts the private key.
+                let summary = try await onQueue { () -> String in
+                    guard let session = self.session else { throw EngineError.message("Not signed in.") }
+                    var local = imported
+                    defer { local.clearKey() }
+                    var error: UnsafeMutablePointer<CChar>?
+                    let rc = local.certificate.withUnsafeBytes { cert in
+                        local.privateKey.withUnsafeBytes { key in
+                            si_cert_import_key(session, cert.bindMemory(to: UInt8.self).baseAddress, cert.count,
+                                               key.bindMemory(to: UInt8.self).baseAddress, key.count, &error)
+                        }
+                    }
+                    if rc != 0 {
+                        let message = error.map { String(cString: $0) } ?? "Could not import signing key."
+                        error.map { si_string_free($0) }
+                        throw EngineError.message(message)
+                    }
+                    return local.commonName + "\nSHA-1: " + local.sha1 + "\nSHA-256: " + local.sha256
+                }
+                certs = try await onQueue { try self.performList() }
+                hasLoaded = true
+                importSummary = summary
+                engine.certConflict = false
+                engine.guide = nil
+                engine.forgetAppleSession()
+            } catch {
+                lastError = short(error)
+            }
+            isWorking = false
+        }
+    }
+
+    /// Deletes only the matching local key; the FFI operation has no Apple
+    /// revocation path. Clearing the session also avoids stale key references.
+    @MainActor
+    func removeLocalKey(_ cert: DevCert) {
+        guard !isWorking, !engine.isRunning, let session else { return }
+        isWorking = true
+        lastError = nil
+        Task { @MainActor in
+            do {
+                try await onQueue {
+                    var error: UnsafeMutablePointer<CChar>?
+                    let rc = si_cert_remove_local_key(session, cert.serialNumber, &error)
+                    if rc != 0 {
+                        let message = error.map { String(cString: $0) } ?? "Could not remove the local key."
+                        error.map { si_string_free($0) }
+                        throw EngineError.message(message)
+                    }
+                }
+                certs = try await onQueue { try self.performList() }
+                importSummary = nil
+                engine.forgetAppleSession()
+            } catch { lastError = short(error) }
+            isWorking = false
+        }
     }
 
     // MARK: - Sign-in

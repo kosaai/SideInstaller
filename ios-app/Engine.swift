@@ -80,7 +80,7 @@ enum EngineError: LocalizedError {
         case .appLimit:
             return L("This iPhone already has three apps signed with a free Apple ID, the most iOS allows, counting expired ones. Delete one of them, then try again.")
         case .certExists:
-            return L("Apple won't issue a signing certificate for this Apple ID: it reports that one already exists, or that a request for one is still pending (error 7460). SideInstaller couldn't reuse the certificate that's already there, so it stopped instead of replacing it. See the steps above.")
+            return L("An Apple signing certificate already exists. Import its P12/PFX file to reuse it.")
         case let .deviceRegistration(udid, raw):
             let tail = udid.isEmpty ? "" : L(" (UDID %@)", udid)
             return L("Couldn't register this iPhone%@ with your Apple ID's developer team, so Apple won't issue a provisioning profile. %@ — see the steps above.",
@@ -266,7 +266,7 @@ final class Engine: ObservableObject {
     /// The current contextual instruction card (nil = none).
     @Published var guide: Guide?
 
-    /// True when signing stopped on error 7460; offers revoke-and-retry.
+    /// True when signing stopped on error 7460; offers P12 import.
     @Published var certConflict: Bool = false
 
     /// True while the one-click pipeline is running.
@@ -423,6 +423,7 @@ final class Engine: ObservableObject {
     // MARK: - Logging
 
     private func installLogging() {
+        si_signing_storage_init(SigningKeychain.read, SigningKeychain.write)
         let rc = si_log_init(siLogCallback, nil)
         if rc == 0 {
             log("si_log_init: OK — idevice tracing is now piped into this console.")
@@ -646,7 +647,7 @@ final class Engine: ObservableObject {
     enum Popup: Hashable {
         /// The code Settings asks for while this iPhone pairs.
         case pairingCode(String)
-        /// Revoke-and-retry, after Apple error 7460.
+        /// Import an existing identity after Apple error 7460.
         case certConflict
         case guide(Guide)
         case error(String, stoppedRun: Bool)
@@ -1624,7 +1625,7 @@ final class Engine: ObservableObject {
             setStep(.sign, .done)
         } catch {
             // User-fixable failures get an explanatory card. A certificate that
-            // already exists offers revoke-and-retry, never revoked automatically.
+            // already exists offers P12 import, never revoked automatically.
             if case EngineError.certExists = error {
                 setGuide(Guides.certExists)
                 certConflict = true
@@ -2646,7 +2647,7 @@ final class Engine: ObservableObject {
         } catch EngineError.certExists {
             // Don't set `certConflict`: its retry button starts a full install
             // from the Install tab. Point to the Certificates page instead.
-            throw EngineError.message(L("Apple won't issue a signing certificate for this Apple ID: it reports that one already exists (error 7460). Revoke it under Tools › Certificates, then refresh again."))
+            throw EngineError.message(L("An Apple signing certificate already exists. Import its P12/PFX file under Tools › Certificates to reuse it."))
         }
         defer { Self.discardSignedBundle(at: signed) }
         installProgress = 0
@@ -3145,17 +3146,11 @@ enum Guides {
 
     /// Shown when Apple refuses a certificate because one exists (error 7460).
     static var certExists: Guide {
-        Guide(
-            title: L("A signing certificate already exists"),
-            systemImage: "exclamationmark.shield",
-            steps: [
-                L("Apple returned error 7460: this Apple ID already has an iOS development certificate, or a request for one is still pending."),
-                L("SideInstaller couldn't reuse it. That happens when the certificate was issued somewhere else — AltStore, SideStore, Sideloadly or Xcode on another device — so the private key it needs isn't on this iPhone."),
-                L("Use “Revoke and retry” above, or open Certificates in the Tools tab, tap “Load certificates”, and revoke it there."),
-                L("Revoking is permanent: every app already signed with that certificate stops launching, on every device."),
-                L("Alternatively, sign in with a different (or spare) Apple ID above, then tap Install again."),
-            ],
-            actionLabel: nil, actionURLString: nil)
+        Guide(title: L("A signing certificate already exists"), systemImage: "checkmark.seal",
+              steps: [L("An Apple signing certificate already exists. Import its P12/PFX file to reuse it."),
+                      L("Open Tools › Certificates › Import P12 / PFX, select the file and enter its password. Empty passwords are supported."),
+                      L("The imported certificate must match this Apple account and include its private key. Then retry Install.")],
+              actionLabel: nil, actionURLString: nil)
     }
 
     /// Shown when the UDID couldn't be registered with the developer team, with
