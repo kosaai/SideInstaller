@@ -12,7 +12,7 @@ struct DevCert: Identifiable, Decodable, Equatable {
     let platform: String
     let status: String
     /// RFC3339 expiry (e.g. `2027-01-01T00:00:00Z`), or "" if Apple omitted it.
-    let hasPrivateKey: Bool
+    var hasPrivateKey: Bool
     let expiration: String
 
     enum CodingKeys: String, CodingKey {
@@ -246,7 +246,8 @@ final class CertManager: ObservableObject {
                 hasLoaded = true
                 importSummary = summary
                 engine.certConflict = false
-                engine.guide = nil
+                if engine.guide == Guides.certExists { engine.guide = nil }
+                if engine.lastError == EngineError.certExists.errorDescription { engine.lastError = nil }
                 engine.forgetAppleSession()
             } catch {
                 lastError = short(error)
@@ -273,7 +274,9 @@ final class CertManager: ObservableObject {
                         throw EngineError.message(message)
                     }
                 }
-                certs = try await onQueue { try self.performList() }
+                // The key has already been deleted locally; reflect that even
+                // when Apple cannot be reached. No portal action is necessary.
+                for index in certs.indices { certs[index].hasPrivateKey = false }
                 importSummary = nil
                 engine.forgetAppleSession()
             } catch { lastError = short(error) }

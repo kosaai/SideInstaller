@@ -31,6 +31,7 @@ pub struct CertSession {
     pub(crate) team: DeveloperTeam,
     apple_email: String,
     storage_dir: PathBuf,
+    certificates: Vec<DevelopmentCertificate>,
 }
 
 // Used only through its own runtime, serialized by Swift on one queue.
@@ -136,7 +137,7 @@ pub unsafe fn cert_signin(
 
     match result {
         Ok(Ok((rt, dev, team, summary))) => {
-            let session = Box::new(CertSession { rt, dev, team, apple_email: apple_id, storage_dir: PathBuf::from(storage_dir) });
+            let session = Box::new(CertSession { rt, dev, team, apple_email: apple_id, storage_dir: PathBuf::from(storage_dir), certificates: Vec::new() });
             *out_session = Box::into_raw(session);
             *out_summary = cstr(summary);
             0
@@ -185,6 +186,7 @@ pub unsafe fn cert_list(
                 }
                 infos.push(info);
             }
+            session.certificates = certs;
             serde_json::to_string(&infos).map_err(|e| format!("serialize certs: {e}"))
         })
     }));
@@ -295,14 +297,13 @@ pub unsafe fn cert_remove_local_key(session: *mut CertSession, serial: *const c_
         if session.is_null() { return Err("No certificate session".to_string()); }
         let serial = opt_str(serial, "");
         let session = &mut *session;
-        session.rt.block_on(async {
-            let certs = session.dev.list_ios_certs(&session.team).await.map_err(|e| report_text(&e))?;
-            let cert = certs.iter().find(|c| c.serial_number.as_deref() == Some(&serial))
-                .ok_or_else(|| "Certificate is no longer listed on Apple".to_string())?;
-            let content = cert.cert_content.as_ref().ok_or_else(|| "Certificate content unavailable".to_string())?;
-            CertificateIdentity::remove_local_key(&session.apple_email, content.as_ref(), &FsStorage::new(session.storage_dir.clone()))
-                .map_err(|_| "Could not remove the local signing key".to_string())
-        })
+        // Use the public certificate from the last list; local deletion works
+        // offline and has no DeveloperSession/network operation.
+        let cert = session.certificates.iter().find(|c| c.serial_number.as_deref() == Some(serial.as_str()))
+            .ok_or_else(|| "Load the certificate list first".to_string())?;
+        let content = cert.cert_content.as_ref().ok_or_else(|| "Certificate content unavailable".to_string())?;
+        CertificateIdentity::remove_local_key(&session.apple_email, content.as_ref(), &FsStorage::new(session.storage_dir.clone()))
+            .map_err(|_| "Could not remove the local signing key".to_string())
     }));
     match result {
         Ok(Ok(())) => 0,
