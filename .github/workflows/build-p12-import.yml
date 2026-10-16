@@ -59,7 +59,15 @@ jobs:
       - name: Package FFI and generate Xcode project
         run: |
           xcodebuild -create-xcframework -library rust-core/target/aarch64-apple-ios/release/libsideinstaller_ffi.a -headers rust-core/include -output SideInstallerFFI.xcframework
-          xcodegen generate
+          # Keep the shipped 1.5.2 identifiers used by the existing IPA signing
+          # workflow. project.yml is an older template; it stays untouched.
+          python3 - <<'PY'
+          from pathlib import Path
+          spec = Path("project.yml").read_text()
+          spec = spec.replace("com.frizzle.sideinstaller", "com.frizzlem.sideinstaller")
+          Path("project-p12.yml").write_text(spec)
+          PY
+          xcodegen generate --spec project-p12.yml
       - name: Build and typecheck iOS application
         run: |
           set -o pipefail
@@ -68,6 +76,17 @@ jobs:
         run: |
           mkdir -p package/Payload
           cp -R build-p12/Build/Products/Release-iphoneos/SideInstaller.app package/Payload/
+          python3 - <<'PY'
+          import plistlib
+          from pathlib import Path
+          app = Path("package/Payload/SideInstaller.app")
+          targets = [(app, "com.frizzlem.sideinstaller"), (app / "PlugIns/SideInstallerLiveActivity.appex", "com.frizzlem.sideinstaller.LiveActivity")]
+          for target, expected in targets:
+              info = plistlib.loads((target / "Info.plist").read_bytes())
+              assert info["CFBundleIdentifier"] == expected, "Bundle ID mismatch"
+              assert info["CFBundleShortVersionString"] == "1.5.2", "Version mismatch"
+              print(target.name, info["CFBundleIdentifier"], info["CFBundleShortVersionString"])
+          PY
           cd package
           zip -qry ../SideInstaller-P12Import.ipa Payload
           cd ..

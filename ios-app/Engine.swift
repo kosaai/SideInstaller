@@ -423,7 +423,9 @@ final class Engine: ObservableObject {
     // MARK: - Logging
 
     private func installLogging() {
-        si_signing_storage_init(SigningKeychain.read, SigningKeychain.write)
+        si_signing_storage_init(
+            { name, output, capacity, length in SigningKeychain.read(name, output, capacity, length) },
+            { name, input, length in SigningKeychain.write(name, input, length) })
         let rc = si_log_init(siLogCallback, nil)
         if rc == 0 {
             log("si_log_init: OK — idevice tracing is now piped into this console.")
