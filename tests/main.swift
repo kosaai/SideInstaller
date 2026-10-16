@@ -1,6 +1,8 @@
 import Foundation
 import Security
 
+setbuf(stdout, nil)
+
 func require(_ condition: @autoclosure () -> Bool, _ name: String) {
     guard condition() else { fatalError("FAIL: " + name) }
     print("PASS: " + name)
@@ -12,6 +14,14 @@ func expectError(_ expected: P12Importer.ImportError, _ name: String, _ work: ()
     } catch { fatalError("Unexpected error in " + name) }
 }
 let root = URL(fileURLWithPath: CommandLine.arguments[1])
+// Only synthetic fixtures: record platform status to diagnose cross-version
+// Security.framework differences without logging any archive/key/password.
+for (name, password) in [("valid.p12", "test-password"), ("empty.pfx", ""), ("cert-only.p12", "test-password")] {
+    let bytes = try Data(contentsOf: root.appendingPathComponent(name))
+    var result: CFArray?
+    let status = SecPKCS12Import(bytes as CFData, [kSecImportExportPassphrase: password] as CFDictionary, &result)
+    print("Native fixture status:", name, status)
+}
 var valid = try P12Importer.decode(Data(contentsOf: root.appendingPathComponent("valid.p12")), password: "test-password")
 require(!valid.certificate.isEmpty && !valid.privateKey.isEmpty, "valid P12 includes certificate and private key")
 require(valid.sha1.count == 40 && valid.sha256.count == 64, "certificate fingerprints")
