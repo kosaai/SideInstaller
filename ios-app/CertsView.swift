@@ -1,21 +1,33 @@
 import SwiftUI
 
-/// Lists and revokes the Apple ID's development certificates (e.g. to fix error
-/// 7460). Pushed from Tools (relies on its `NavigationStack`).
+/// Existing Apple certificates and their local signing-key availability.
 struct CertsView: View {
     /// Observed so labels redraw when the language changes.
     @EnvironmentObject private var loc: Localizer
     @ObservedObject var manager: CertManager
 
     @State private var showSettings = false
-    /// The certificate the user tapped "Revoke" on, pending confirmation.
-    @State private var pendingRevoke: DevCert?
+    @State private var pendingRemoval: DevCert?
 
     var body: some View {
         ScrollView {
             VStack(spacing: 18) {
                 header.cascadeItem(0)
+                Button { manager.showP12Importer = true } label: {
+                    Label("Import P12 / PFX", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(PrimaryButtonStyle())
+                .disabled(manager.isWorking || Engine.shared.isRunning)
                 loadButton.cascadeItem(1)
+                if let summary = manager.importSummary {
+                    PanelCard {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("Certificate imported", systemImage: "checkmark.seal.fill")
+                                .foregroundStyle(.green)
+                            Text(summary).font(.caption).textSelection(.enabled)
+                        }
+                    }
+                }
                 // Errors show as a popup, which `RootView` lays over the app.
                 certList
             }
@@ -28,20 +40,16 @@ struct CertsView: View {
         .toolbar { settingsToolbarItem(isPresented: $showSettings) }
         .sheet(isPresented: $showSettings) { SettingsView() }
         .onAppear { manager.autoLoad() }
-        .alert(L("Revoke this certificate?"),
-               isPresented: Binding(get: { pendingRevoke != nil },
-                                    set: { if !$0 { pendingRevoke = nil } })) {
-            Button(L("Revoke"), role: .destructive) {
-                if let cert = pendingRevoke { manager.revoke(cert) }
-                pendingRevoke = nil
+        .alert("Remove Local Key?", isPresented: Binding(
+            get: { pendingRemoval != nil }, set: { if !$0 { pendingRemoval = nil } })) {
+                Button("Remove Local Key", role: .destructive) {
+                    if let cert = pendingRemoval { manager.removeLocalKey(cert) }
+                    pendingRemoval = nil
+                }
+                Button("Cancel", role: .cancel) { pendingRemoval = nil }
+            } message: {
+                Text("This removes only the private key stored on this device. The certificate on Apple and apps already signed with it are not revoked. You can import its P12/PFX again.")
             }
-            Button(L("Cancel"), role: .cancel) { pendingRevoke = nil }
-        } message: {
-            if let cert = pendingRevoke {
-                Text(L("“%@” will be revoked. Apps already signed with it will stop launching on every device. This can't be undone.",
-                       cert.displayName))
-            }
-        }
     }
 
     // MARK: Header
@@ -107,7 +115,7 @@ struct CertsView: View {
                     .foregroundStyle(Theme.brand)
                 Text(L("No certificates"))
                     .font(.headline)
-                Text(L("This Apple ID has no development certificates to revoke."))
+                Text(L("This Apple ID has no development certificates."))
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -118,7 +126,7 @@ struct CertsView: View {
     }
 
     private func certRow(_ cert: DevCert) -> some View {
-        let revoking = manager.revokingID == cert.id
+        let ready = cert.hasPrivateKey && !cert.isExpired
         return PanelCard {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .top, spacing: 12) {
@@ -163,25 +171,26 @@ struct CertsView: View {
                     .foregroundStyle(.secondary)
                 }
 
-                Button(role: .destructive) {
-                    pendingRevoke = cert
-                } label: {
-                    HStack(spacing: 6) {
-                        if revoking {
-                            ProgressView().controlSize(.small)
-                            Text(L("Revoking"))
-                        } else {
-                            Image(systemName: "trash")
-                            Text(L("Revoke"))
-                        }
-                    }
-                    .font(.subheadline.weight(.medium))
-                    .frame(maxWidth: .infinity)
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Apple Certificate: Found", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Label(cert.hasPrivateKey ? "Private Key: Available" : "Private Key: Missing",
+                          systemImage: cert.hasPrivateKey ? "key.fill" : "key.slash")
+                    Label(ready ? "Ready for signing" : "Signing: Not Ready",
+                          systemImage: ready ? "checkmark.seal.fill" : "exclamationmark.circle")
+                        .foregroundStyle(ready ? .green : .orange)
                 }
-                .buttonStyle(.bordered)
-                .tint(.red)
-                .controlSize(.regular)
-                .disabled(revoking || manager.isWorking || manager.revokingID != nil)
+                .font(.caption)
+                if cert.hasPrivateKey {
+                    DisclosureGroup("Certificate details") {
+                        Button("Remove Local Key", role: .destructive) { pendingRemoval = cert }
+                            .font(.caption)
+                            .buttonStyle(.bordered)
+                            .padding(.top, 8)
+                            .disabled(manager.isWorking || Engine.shared.isRunning)
+                    }
+                    .font(.caption)
+                }
             }
         }
     }

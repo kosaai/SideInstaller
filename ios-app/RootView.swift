@@ -101,6 +101,7 @@ struct RootView: View {
         // The Install tab's revoke-and-retry runs through this same manager
         // (declared below the popups, which use it too).
         .environmentObject(certManager)
+        .modifier(P12ImportPresenter(manager: certManager))
         // When the active Apple ID changes, drop all four cached Apple sessions
         // (Side by Side's included) so none is reused for the new account.
         .onChange(of: accounts.revision) { _, _ in

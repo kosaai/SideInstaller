@@ -935,8 +935,6 @@ struct InstallPopup: View {
     /// Shared with the Certificates page; revoke-and-retry runs through it.
     @EnvironmentObject private var certManager: CertManager
     @Environment(\.openURL) private var openURL
-    /// Shows the dialog for choosing which certificate to revoke.
-    @State private var showRevokeChooser = false
 
     var body: some View {
         switch popup {
@@ -998,68 +996,28 @@ struct InstallPopup: View {
 
     // MARK: Certificate conflict (Apple error 7460)
 
-    /// Shown on error 7460. The button loads the certificates; the dialog asks
-    /// which one to revoke, then retries the install.
+    /// Error 7460 always offers import, never revoke or certificate creation.
     private var certConflictPopup: some View {
         PopupCard(title: L("A certificate already exists"),
-                  systemImage: "exclamationmark.shield.fill",
-                  tint: .orange,
-                  onClose: close) {
+                  systemImage: "exclamationmark.shield.fill", tint: .orange, onClose: close) {
             VStack(alignment: .leading, spacing: 14) {
-                Text(L("Apple won't issue a second signing certificate for this Apple ID. Revoking the one it already has lets the install continue — but it can't be undone."))
+                Text("An Apple signing certificate already exists. Import its P12/PFX file to reuse it.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
                 Button {
-                    // Load first, so the chooser can name the certificates.
-                    certManager.ensureLoaded { showRevokeChooser = true }
+                    close()
+                    certManager.showP12Importer = true
                 } label: {
-                    HStack(spacing: 8) {
-                        if certManager.isWorking {
-                            ProgressView().controlSize(.small)
-                            Text(L("Loading certificates"))
-                        } else {
-                            Image(systemName: "arrow.clockwise.circle")
-                            Text(L("Revoke and retry"))
-                        }
-                    }
-                    .font(.subheadline.weight(.semibold))
-                    .frame(maxWidth: .infinity)
+                    Label("Import P12 / PFX", systemImage: "square.and.arrow.down")
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .tint(.orange)
-                .disabled(certManager.isWorking || certManager.revokingID != nil)
-                // A failed load or revoke shows as the Certificates popup, under
-                // this one.
+                .disabled(certManager.isWorking || engine.isRunning)
+                Button("Cancel", role: .cancel, action: close)
             }
-            .animation(.smooth(duration: 0.3), value: certManager.isWorking)
-        }
-        .confirmationDialog(L("Which certificate should be revoked?"),
-                            isPresented: $showRevokeChooser,
-                            titleVisibility: .visible) {
-            ForEach(certManager.certs) { cert in
-                Button(revokeButtonLabel(for: cert), role: .destructive) {
-                    certManager.revoke(cert) {
-                        engine.log("Retrying the install after revoking \(cert.displayName).")
-                        engine.runOneClick()
-                    }
-                }
-            }
-            Button(L("Cancel"), role: .cancel) { }
-        } message: {
-            Text(certManager.certs.isEmpty
-                 ? L("Apple reports a certificate on this Apple ID, but none came back in the list. It may be a request that's still pending — wait a few minutes and tap Install again.")
-                 : L("Every app already signed with the certificate you pick will stop launching, on every device — including apps installed by AltStore, SideStore, or a computer. This can't be undone. The install retries straight afterwards."))
         }
     }
 
-    /// Names a certificate in the chooser, with its machine and expiry.
-    private func revokeButtonLabel(for cert: DevCert) -> String {
-        var label = cert.displayName
-        if let machine = cert.machineLabel { label += " — \(machine)" }
-        if cert.isExpired { label += L(" (expired)") }
-        return label
-    }
 }
 
 // MARK: - Toolbar
