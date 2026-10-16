@@ -2,6 +2,9 @@ name: Sign SideInstaller P12 Import Qusai
 
 on:
   workflow_dispatch:
+  push:
+    branches: [feature/import-existing-p12]
+    paths: [.github/workflows/sign-p12-import.yml]
 
 permissions:
   contents: read
@@ -9,6 +12,7 @@ permissions:
 
 jobs:
   sign:
+    if: github.event_name == 'workflow_dispatch'
     name: Sign SideInstallerQusai-P12Import.ipa
     runs-on: macos-14
     timeout-minutes: 30
